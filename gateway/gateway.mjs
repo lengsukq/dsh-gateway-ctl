@@ -223,7 +223,205 @@ function clearSessionCookie(res, req) {
 }
 
 function loginPage(error) {
-  return `<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DSH 远程网关</title><style>body{background:#0d1117;color:#e6edf3;font-family:system-ui,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}form{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;width:min(360px,90vw)}h1{font-size:18px;margin:0 0 8px}p{color:#8b949e;font-size:13px}.pw-wrap{position:relative;margin:12px 0}input{width:100%;box-sizing:border-box;background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:8px;padding:10px 44px 10px 12px;font-size:15px}input:focus{border-color:#1f6feb;outline:none}.pw-toggle{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:0;color:#8b949e;font-size:18px;cursor:pointer;padding:6px;border-radius:6px}.pw-toggle:hover{color:#e6edf3}button.submit{width:100%;background:#1f6feb;border:0;color:#fff;border-radius:8px;padding:10px;font-size:15px;cursor:pointer}.err{color:#f85149;font-size:13px;min-height:18px}</style></head><body><form method="post" action="/__gw/login"><h1>DSH 远程网关</h1><p>外网访问需要口令验证（局域网直连免验证）</p><div class="err">${error ? '口令错误，请重试' : ''}</div><div class="pw-wrap"><input id="pw" type="password" name="password" placeholder="访问口令" autofocus autocomplete="current-password"><button class="pw-toggle" type="button" id="pwToggle" title="显示/隐藏口令">👁</button></div><button class="submit" type="submit">进入</button><script>(function(){var i=document.getElementById('pw'),b=document.getElementById('pwToggle');b.onclick=function(){var show=i.type==='password';i.type=show?'text':'password';b.textContent=show?'🙈':'👁';};})();</script></form></body></html>`;
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <title>DSH 远程网关验证</title>
+  <style>
+    :root {
+      --bg: #090b10;
+      --card-bg: rgba(18, 22, 34, 0.85);
+      --border: rgba(255, 255, 255, 0.1);
+      --border-focus: #3b82f6;
+      --text-primary: #f3f4f6;
+      --text-secondary: #9ca3af;
+      --brand: #3b82f6;
+      --brand-hover: #2563eb;
+      --error: #ef4444;
+      --error-bg: rgba(239, 68, 68, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      background-image: 
+        radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.15) 0%, transparent 60%),
+        radial-gradient(circle at 100% 100%, rgba(99, 102, 241, 0.08) 0%, transparent 40%);
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .card {
+      width: 100%;
+      max-width: 380px;
+      background: var(--card-bg);
+      backdrop-filter: blur(24px);
+      -webkit-backdrop-filter: blur(24px);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 36px 28px;
+      box-shadow: 0 24px 64px -12px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.05);
+      text-align: center;
+      animation: fadeIn 0.3s ease-out;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: scale(0.96) translateY(6px); }
+      to { opacity: 1; transform: scale(1) translateY(0); }
+    }
+    .icon-badge {
+      width: 52px;
+      height: 52px;
+      margin: 0 auto 16px;
+      background: linear-gradient(135deg, rgba(59, 130, 246, 0.2), rgba(99, 102, 241, 0.2));
+      border: 1px solid rgba(59, 130, 246, 0.3);
+      border-radius: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #60a5fa;
+      box-shadow: 0 8px 16px -4px rgba(59, 130, 246, 0.2);
+    }
+    h1 {
+      margin: 0 0 6px;
+      font-size: 20px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+    p {
+      margin: 0 0 20px;
+      font-size: 13px;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+    .alert {
+      background: var(--error-bg);
+      border: 1px solid rgba(239, 68, 68, 0.25);
+      color: var(--error);
+      padding: 9px 12px;
+      border-radius: 10px;
+      font-size: 13px;
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      animation: shake 0.35s cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+    }
+    @keyframes shake {
+      10%, 90% { transform: translate3d(-1px, 0, 0); }
+      20%, 80% { transform: translate3d(2px, 0, 0); }
+      30%, 50%, 70% { transform: translate3d(-3px, 0, 0); }
+      40%, 60% { transform: translate3d(3px, 0, 0); }
+    }
+    .pw-wrap {
+      position: relative;
+      margin-bottom: 18px;
+    }
+    input {
+      width: 100%;
+      background: rgba(10, 13, 20, 0.7);
+      border: 1px solid var(--border);
+      color: var(--text-primary);
+      border-radius: 12px;
+      padding: 12px 46px 12px 14px;
+      font-size: 15px;
+      outline: none;
+      transition: all 0.2s;
+    }
+    input:focus {
+      border-color: var(--border-focus);
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+    }
+    .pw-toggle {
+      position: absolute;
+      right: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: none;
+      border: none;
+      color: var(--text-secondary);
+      font-size: 18px;
+      cursor: pointer;
+      padding: 6px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: color 0.15s;
+    }
+    .pw-toggle:hover { color: var(--text-primary); }
+    button.submit {
+      width: 100%;
+      background: var(--brand);
+      border: none;
+      color: #ffffff;
+      border-radius: 12px;
+      padding: 12px;
+      font-size: 15px;
+      font-weight: 500;
+      cursor: pointer;
+      box-shadow: 0 4px 12px rgba(59, 130, 246, 0.35);
+      transition: all 0.2s;
+    }
+    button.submit:hover {
+      background: var(--brand-hover);
+      box-shadow: 0 6px 18px rgba(59, 130, 246, 0.45);
+      transform: translateY(-1px);
+    }
+    button.submit:active { transform: translateY(0); }
+    .hint {
+      margin-top: 20px;
+      font-size: 12px;
+      color: #6b7280;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon-badge">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+        <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+      </svg>
+    </div>
+    <h1>DSH 远程安全网关</h1>
+    <p>外网访问已受保护，请输入访问口令验证后进入桌面</p>
+    ${error ? `<div class="alert"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg> 口令错误，请重新输入</div>` : ''}
+    <form method="post" action="/__gw/login">
+      <div class="pw-wrap">
+        <input id="pw" type="password" name="password" placeholder="请输入网关访问口令" autofocus autocomplete="current-password" required>
+        <button class="pw-toggle" type="button" id="pwToggle" title="显示/隐藏口令" aria-label="显示/隐藏口令">
+          <svg id="eyeOpen" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+          <svg id="eyeClosed" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>
+        </button>
+      </div>
+      <button class="submit" type="submit">立即进入</button>
+    </form>
+    <div class="hint">同一局域网/WiFi 下直连网关 IP 可免密访问</div>
+  </div>
+  <script>
+    (function(){
+      var input = document.getElementById('pw');
+      var btn = document.getElementById('pwToggle');
+      var eyeOpen = document.getElementById('eyeOpen');
+      var eyeClosed = document.getElementById('eyeClosed');
+      btn.onclick = function() {
+        var isText = input.type === 'text';
+        input.type = isText ? 'password' : 'text';
+        eyeOpen.style.display = isText ? 'block' : 'none';
+        eyeClosed.style.display = isText ? 'none' : 'block';
+      };
+    })();
+  </script>
+</body>
+</html>`;
 }
 
 function readBody(req, limit = 4096) {
@@ -443,14 +641,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (url.pathname === '/__gw/reveal') {
-      // 取回当前口令明文: 调用者必须已持有有效网关 session(登录态本身就是凭证)。
-      // 不再要求直连 —— 经网关代签登录的外网页同样持有有效 session; 未登录一律 403。
+      // 取回当前口令明文: 局域网直连(可信内网)或已登录 session 可调
       if (req.method !== 'POST') {
         res.writeHead(405, { 'content-type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: false, error: 'POST only' }));
         return;
       }
-      if (!hasSession(req)) {
+      if (!allowed(req)) {
         res.writeHead(403, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
         res.end(JSON.stringify({ ok: false, error: '请先登录后再查看' }));
         return;
@@ -466,15 +663,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (url.pathname === '/__gw/rotate') {
-      // 随机生成并立即更换口令: 调用者须持有有效 session。返回新口令明文一次,
-      // 同时旧 session 全部作废 —— 调用者需用新口令重新登录(网关页)，
-      // DSH 侧栏弹框走的是 DSH 本体 session，不受影响。
+      // 随机生成并立即更换口令: 局域网直连(可信内网)或已登录 session 可调
       if (req.method !== 'POST') {
         res.writeHead(405, { 'content-type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: false, error: 'POST only' }));
         return;
       }
-      if (!hasSession(req)) {
+      if (!allowed(req)) {
         res.writeHead(403, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
         res.end(JSON.stringify({ ok: false, error: '请先登录后再更换' }));
         return;

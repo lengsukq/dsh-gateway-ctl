@@ -1,11 +1,14 @@
 // DSH 独立网关: 监听 GW_PORT(默认 3081), 反代 DSH 本体(默认 127.0.0.1:3080).
 // 安全模型:
-// 1. 基于真实客户端 IP & CIDR 规范判定局域网，杜绝 Host 头伪造
-// 2. 支持「局域网密码保护」开关 (lanAuth: true/false)
-// 3. 密码散列全面升级为加盐 scrypt（兼容平滑迁移旧 SHA-256）
-// 4. 基于 IP 的登录失败限流与指数退避（5次失败后锁定）
-// 5. 结构化访问审计日志与自动轮转 (~/.dsh/gateway/access.log)
-// 6. DSH 3080 端口暴露主动检测与防穿透警示
+// 1. Pairing Token + Device Credential: 一次性扫码配对令牌 (90秒)，彻底消除 URL 中的主密码
+// 2. 独立设备体系 (devices.json): 每台扫码设备分配独立 Device Token，支持设备列表展示与一键撤销
+// 3. 彻底抹除明文密码存储: 仅保留加盐 scrypt 哈希 (.gw_password)，安全擦除 .gw_secret
+// 4. 基于真实客户端 IP & CIDR 规范判定局域网，杜绝 Host 头伪造
+// 5. 局域网密码保护可选开关 (lanAuth: true/false)
+// 6. 登录失败限流与指数退避（5次失败后锁定）
+// 7. 结构化访问审计日志与自动轮转 (~/.dsh/gateway/access.log)
+// 8. DSH 3080 端口暴露主动检测与防穿透警示
+// 9. CORS 严格白名单收敛，杜绝带凭证的任意 Origin 泛反射
 import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
@@ -18,17 +21,39 @@ const UP_HOST = process.env.GW_UPSTREAM_HOST || '127.0.0.1';
 const UP_PORT = parseInt(process.env.GW_UPSTREAM_PORT || '3080', 10);
 const DSH_TOKEN = process.env.GW_DSH_TOKEN || '';
 const SESSION_TTL_MS = (parseInt(process.env.GW_SESSION_TTL_H || '24', 10) || 24) * 3600 * 1000;
+const DEVICE_TTL_MS = 365 * 24 * 3600 * 1000; // 设备凭证默认有效期 1 年 (可在控制台随时撤销)
 const DIR = process.env.GW_DIR || path.join(os.homedir(), '.dsh', 'gateway');
 const HASH_FILE = path.join(DIR, '.gw_password');
 const PW_FILE = path.join(DIR, '.gw_secret');
 const CONFIG_FILE = path.join(DIR, 'config.json');
 const ACCESS_LOG_FILE = path.join(DIR, 'access.log');
+const DEVICES_FILE = path.join(DIR, 'devices.json');
+const REMOTES_FILE = path.join(DIR, 'remotes.json');
 const CRED_FILE = process.env.GW_CRED_FILE || path.join(os.homedir(), '.dsh', '.credentials.yaml');
 const DSH_TOKEN_FILE = path.join(DIR, '.dsh_token');
 const COOKIE_NAME = 'gw_session';
+const DEVICE_COOKIE_NAME = 'gw_device';
 const UP_ORIGIN = `http://${UP_HOST}:${UP_PORT}`;
 
 fs.mkdirSync(DIR, { recursive: true });
+
+// ---- 安全擦除历史明文密码文件 (.gw_secret) ----
+function secureShredFile(filePath) {
+  try {
+    if (fs.existsSync(filePath)) {
+      const stat = fs.statSync(filePath);
+      const zeros = Buffer.alloc(stat.size);
+      fs.writeFileSync(filePath, zeros);
+      fs.unlinkSync(filePath);
+      console.log(`[gw-security] ✓ securely shredded legacy plaintext secret file: ${filePath}`);
+    }
+  } catch (e) {
+    console.error(`[gw-security] failed to shred ${filePath}:`, e.message);
+  }
+}
+
+// 启动时立即安全擦除明文密码文件
+secureShredFile(PW_FILE);
 
 // ---- 网关全局安全配置 (config.json) ----
 function loadConfig() {
@@ -77,9 +102,9 @@ function verifyPassword(pw, stored) {
   const actual = Buffer.from(h, 'hex');
   const match = expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
   if (match) {
-    // 验证成功后静默升级为 scrypt
+    // 验证成功后升级为 scrypt
     try {
-      persistSecret(pw);
+      persistPasswordHash(pw);
       console.log('[gw] auto-upgraded legacy SHA-256 hash to scrypt');
     } catch {}
   }
@@ -93,7 +118,7 @@ function loadHash() {
   } catch { return null; }
 }
 
-function makePassword(length) {
+function makeRandomPassword(length = 12) {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
   const bytes = crypto.randomBytes(length);
   let out = '';
@@ -101,15 +126,7 @@ function makePassword(length) {
   return out;
 }
 
-function loadSecret() {
-  try {
-    const s = fs.readFileSync(PW_FILE, 'utf8').trim();
-    return s.length >= 6 && s.length <= 128 ? s : null;
-  } catch { return null; }
-}
-
-function persistSecret(pw) {
-  fs.writeFileSync(PW_FILE, pw + '\n', { mode: 0o600 });
+function persistPasswordHash(pw) {
   const hash = hashPasswordScrypt(pw);
   fs.writeFileSync(HASH_FILE, hash + '\n', { mode: 0o600 });
   passwordHash = hash;
@@ -118,33 +135,105 @@ function persistSecret(pw) {
 
 let passwordHash = loadHash();
 if (process.env.GW_PASSWORD) {
-  persistSecret(process.env.GW_PASSWORD);
+  persistPasswordHash(process.env.GW_PASSWORD);
   console.log('[gw] password updated from GW_PASSWORD');
 }
 
 if (!passwordHash) {
-  const fresh = makePassword(12);
-  passwordHash = persistSecret(fresh);
-  console.log(`[gw] FIRST_START_PASSWORD=${fresh}`);
-} else if (!loadSecret()) {
-  const fresh = makePassword(12);
-  passwordHash = persistSecret(fresh);
-  console.log(`[gw] password rotated (plaintext store missing), NEW_PASSWORD=${fresh}`);
-} else if (!passwordHash.startsWith('scrypt$')) {
-  // 存在明文但哈希还是旧版的，直接就地升级为 scrypt
-  const currentPw = loadSecret();
-  if (currentPw) {
-    persistSecret(currentPw);
-    console.log('[gw] upgraded existing password store to scrypt');
+  const fresh = makeRandomPassword(12);
+  passwordHash = persistPasswordHash(fresh);
+  console.log(`\x1b[32m[gw] FIRST_START_PASSWORD=${fresh} (请妥善保存此密码，可在本机终端通过 gw.sh password <new> 重置)\x1b[0m`);
+}
+
+// ---- 设备凭证管理 (devices.json) ----
+function loadDevices() {
+  try {
+    const raw = fs.readFileSync(DEVICES_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
   }
 }
+
+function saveDevices(list) {
+  try {
+    fs.writeFileSync(DEVICES_FILE, JSON.stringify(list, null, 2) + '\n', { mode: 0o600 });
+  } catch (e) {
+    console.error('[gw] saveDevices error:', e);
+  }
+}
+
+function parseDeviceName(ua) {
+  if (!ua) return '移动设备';
+  let os = '未知设备';
+  if (/iPhone/i.test(ua)) os = 'iPhone';
+  else if (/iPad/i.test(ua)) os = 'iPad';
+  else if (/Macintosh|Mac OS X/i.test(ua)) os = 'Mac';
+  else if (/Android/i.test(ua)) os = 'Android';
+  else if (/Windows/i.test(ua)) os = 'Windows';
+  else if (/Linux/i.test(ua)) os = 'Linux';
+
+  let browser = '';
+  if (/MicroMessenger/i.test(ua)) browser = '微信';
+  else if (/Chrome/i.test(ua) && !/Edg/i.test(ua)) browser = 'Chrome';
+  else if (/Safari/i.test(ua) && !/Chrome/i.test(ua)) browser = 'Safari';
+  else if (/Firefox/i.test(ua)) browser = 'Firefox';
+  else if (/Edg/i.test(ua)) browser = 'Edge';
+
+  return browser ? `${os} · ${browser}` : os;
+}
+
+function hashToken(tok) {
+  return crypto.createHash('sha256').update(tok, 'utf8').digest('hex');
+}
+
+// ---- 一次性配对令牌 (Pairing Token) 管理 ----
+// key: pairToken (base64url) -> { createdAt, expiresAt, used }
+const pairingTokens = new Map();
+
+function createPairingToken() {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const now = Date.now();
+  const ttlMs = 90 * 1000; // 90 秒有效
+  const record = {
+    token,
+    createdAt: now,
+    expiresAt: now + ttlMs,
+    used: false,
+  };
+  pairingTokens.set(token, record);
+  return record;
+}
+
+function consumePairingToken(token) {
+  if (!token || typeof token !== 'string') return null;
+  const record = pairingTokens.get(token);
+  if (!record) return null;
+  const now = Date.now();
+  if (record.used || record.expiresAt <= now) {
+    pairingTokens.delete(token);
+    return null;
+  }
+  // 消费即标记作废
+  record.used = true;
+  pairingTokens.delete(token);
+  return record;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [t, r] of pairingTokens) {
+    if (r.expiresAt <= now || r.used) pairingTokens.delete(t);
+  }
+}, 30_000).unref();
 
 // ---- 真实客户端 IP 提取与私网 CIDR 判定算法 ----
 function getClientIp(req) {
   const sockIp = (req.socket && req.socket.remoteAddress) || '';
   const cleanSock = sockIp.replace(/^::ffff:/, '').trim();
 
-  // 若直接连接来自回环 (127.0.0.1 / ::1 / localhost)，信任其转发头
+  // 若直接连接来自回环 (127.0.0.1 / ::1 / localhost)，信任反代头
   if (cleanSock === '127.0.0.1' || cleanSock === '::1') {
     const cf = req.headers['cf-connecting-ip'];
     if (typeof cf === 'string' && cf.trim()) return cf.trim().replace(/^::ffff:/, '');
@@ -173,15 +262,12 @@ function inIpv4Cidr(ip, cidr) {
   return (ipv4ToLong(ip) & mask) === (ipv4ToLong(netIp) & mask);
 }
 
-// 严格基于真实 IP 的私网/局域网判定（不依赖伪造的 Host 头）
 function isPrivateLanIp(ip) {
   if (!ip) return false;
   if (ip === '127.0.0.1' || ip === '::1' || ip === 'localhost') return true;
-  // IPv6 ULA or link-local
   if (/^fe80:/i.test(ip) || /^fc00:/i.test(ip) || /^fd00:/i.test(ip)) return true;
   if (!net.isIPv4(ip)) return false;
 
-  // RFC 1918 & CGNAT & Loopback
   if (inIpv4Cidr(ip, '127.0.0.0/8')) return true;
   if (inIpv4Cidr(ip, '10.0.0.0/8')) return true;
   if (inIpv4Cidr(ip, '172.16.0.0/12')) return true;
@@ -191,12 +277,10 @@ function isPrivateLanIp(ip) {
   return false;
 }
 
-// 是否为当前运行网关的宿主机本地直接发起的请求 (127.0.0.1 / ::1 且无代理跳数)
 function isLocalhostRequest(req) {
   const sockIp = (req.socket && req.socket.remoteAddress) || '';
   const cleanSock = sockIp.replace(/^::ffff:/, '').trim();
   if (cleanSock !== '127.0.0.1' && cleanSock !== '::1') return false;
-  // 检查是否有外部代理头，如果有说明并非真正的宿主机内部进程调用
   if (req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.headers['x-real-ip']) {
     return false;
   }
@@ -204,8 +288,7 @@ function isLocalhostRequest(req) {
 }
 
 // ---- 防暴力破解限流器 (RateLimiter) ----
-// 5 次失败后触发指数退避: 30s -> 60s -> 120s -> 300s -> 900s
-const failedAttempts = new Map(); // ip -> { count, lockedUntil }
+const failedAttempts = new Map();
 
 function checkRateLimit(ip) {
   const record = failedAttempts.get(ip);
@@ -222,8 +305,8 @@ function recordLoginFailure(ip) {
   const record = failedAttempts.get(ip) || { count: 0, lockedUntil: 0 };
   record.count += 1;
   if (record.count >= 5) {
-    const exponent = Math.min(record.count - 5, 4); // 0, 1, 2, 3, 4
-    const delays = [30, 60, 120, 300, 900]; // 秒
+    const exponent = Math.min(record.count - 5, 4);
+    const delays = [30, 60, 120, 300, 900];
     const delaySec = delays[exponent];
     record.lockedUntil = now + delaySec * 1000;
   }
@@ -246,7 +329,6 @@ setInterval(() => {
 // ---- 结构化安全访问审计日志 (access.log) ----
 function appendAccessLog(event) {
   try {
-    // 检查日志文件大小，超过 2MB 自动轮转
     try {
       const st = fs.statSync(ACCESS_LOG_FILE);
       if (st.size > 2 * 1024 * 1024) {
@@ -314,11 +396,9 @@ function checkPort3080Exposure() {
   });
 }
 
-// 启动时主动检测并打印安全规范
 checkPort3080Exposure().then((res) => {
   if (res.exposed) {
-    console.warn(`\x1b[31m[gw-security] ⚠️ 警告: 检测到 DSH 3080 端口已直接暴露在局域网 IP (${res.checkedIp})！`);
-    console.warn(`[gw-security] 请检查 DSH 配置，切勿直接将 3080 暴露给外部或隧道，必须经由 :${PORT} 网关统一鉴权！\x1b[0m`);
+    console.warn(`\x1b[31m[gw-security] ⚠️ 警告: 检测到 DSH 3080 端口已直接暴露在局域网 IP (${res.checkedIp})！\x1b[0m`);
   } else {
     console.log(`[gw-security] ✓ DSH 3080 端口受限状态正常（未向局域网暴露）`);
   }
@@ -365,6 +445,7 @@ function loadDshToken() {
     return t || '';
   } catch { return ''; }
 }
+
 function dshAuthCookieHeader() {
   if (!dshSecret) return null;
   const now = Date.now();
@@ -377,29 +458,26 @@ function dshAuthCookieHeader() {
   const val = dshEncodeCookie(payload, dshSecret);
   return `${DSH_COOKIE_NAME}=${val}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 3600}`;
 }
-function clientHasDshCookie(req) {
-  const c = parseCookies(req)[DSH_COOKIE_NAME];
-  return typeof c === 'string' && c.startsWith('v1.');
-}
-
-function appendCookie(headers, extra) {
-  const out = { ...headers };
-  const prev = out['set-cookie'];
-  if (prev === undefined) out['set-cookie'] = [extra];
-  else if (Array.isArray(prev)) out['set-cookie'] = [...prev, extra];
-  else out['set-cookie'] = [prev, extra];
-  return out;
-}
 
 function isReqHttps(req) {
   return (req.headers && req.headers['x-forwarded-proto'] === 'https') || !!(req.socket && req.socket.encrypted);
 }
 
-// 登录成功后同时种下 DSH cookie(两个 Set-Cookie), 浏览器直达 DSH, 不再弹 token 页
+// 登录成功后种下会话 Cookie (含 DSH 代签)
 function setLoginCookies(res, secure) {
   const tok = crypto.randomBytes(32).toString('hex');
   sessions.set(tok, Date.now() + SESSION_TTL_MS);
   const parts = [`${COOKIE_NAME}=${tok}`, 'Path=/', 'HttpOnly', 'SameSite=Lax', `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`];
+  if (secure) parts.push('Secure');
+  const cookies = [parts.join('; ')];
+  const dsh = dshAuthCookieHeader();
+  if (dsh) cookies.push(dsh + (secure ? '; Secure' : ''));
+  res.setHeader('set-cookie', cookies);
+}
+
+// 为配对成功的设备签发专属设备凭证
+function setDeviceCookies(res, deviceRawToken, secure) {
+  const parts = [`${DEVICE_COOKIE_NAME}=${deviceRawToken}`, 'Path=/', 'HttpOnly', 'SameSite=Lax', `Max-Age=${Math.floor(DEVICE_TTL_MS / 1000)}`];
   if (secure) parts.push('Secure');
   const cookies = [parts.join('; ')];
   const dsh = dshAuthCookieHeader();
@@ -426,35 +504,50 @@ function parseCookies(req) {
   return out;
 }
 
+// 鉴权判定：同时支持 普通会话 (gw_session) 或 独立设备凭证 (gw_device)
 function hasSession(req) {
-  const tok = parseCookies(req)[COOKIE_NAME];
-  if (!tok || !/^[0-9a-f]{64}$/.test(tok)) return false;
-  const exp = sessions.get(tok);
-  if (!exp || exp <= Date.now()) {
-    sessions.delete(tok);
-    return false;
+  const cookies = parseCookies(req);
+
+  // 1. 检查短期网页会话
+  const sessTok = cookies[COOKIE_NAME];
+  if (sessTok && /^[0-9a-f]{64}$/.test(sessTok)) {
+    const exp = sessions.get(sessTok);
+    if (exp && exp > Date.now()) return true;
+    if (exp) sessions.delete(sessTok);
   }
-  return true;
+
+  // 2. 检查独立设备凭证
+  const devTok = cookies[DEVICE_COOKIE_NAME];
+  if (devTok && typeof devTok === 'string' && devTok.length >= 32) {
+    const thash = hashToken(devTok);
+    const devices = loadDevices();
+    const hit = devices.find((d) => d.tokenHash === thash && d.status === 'active');
+    if (hit) {
+      // 触碰活跃时间 (每 5 分钟更新一次避免频繁写盘)
+      const now = Date.now();
+      const last = hit.lastActiveAt ? new Date(hit.lastActiveAt).getTime() : 0;
+      if (now - last > 5 * 60 * 1000) {
+        hit.lastActiveAt = new Date().toISOString();
+        hit.lastIp = getClientIp(req);
+        saveDevices(devices);
+      }
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /** 访问放行核心判定: 基于 IP、CIDR 与安全配置 */
 function allowed(req) {
-  // 1. 本机 localhost 回环直接放行（完全可信的本机控制）
   if (isLocalhostRequest(req)) return true;
-
-  // 2. 已持有有效会话 Cookie
   if (hasSession(req)) return true;
 
-  // 3. 局域网私网 IP: 检查是否开启了局域网保护
   const clientIp = getClientIp(req);
   if (isPrivateLanIp(clientIp)) {
-    // 若开启了局域网口令保护 (lanAuth === true)，则局域网设备也必须登录
     if (gwConfig.lanAuth) return false;
-    // 默认局域网免密放行
     return true;
   }
-
-  // 4. 其余公网外网 IP 必须验证
   return false;
 }
 
@@ -474,14 +567,13 @@ function deny(req, res) {
   }
 }
 
-function setSessionCookie(res, secure) {
-  setLoginCookies(res, secure);
-}
-
 function clearSessionCookie(res, req) {
   const tok = parseCookies(req)[COOKIE_NAME];
   if (tok) sessions.delete(tok);
-  res.setHeader('set-cookie', `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+  res.setHeader('set-cookie', [
+    `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`,
+    `${DEVICE_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`,
+  ]);
 }
 
 function loginPage(errorText, lockedSec) {
@@ -671,7 +763,7 @@ function loginPage(errorText, lockedSec) {
       </div>
       <button class="submit" id="subBtn" type="submit" ${isLocked ? 'disabled' : ''}>${isLocked ? `已锁定 (${lockedSec}s)` : '立即进入'}</button>
     </form>
-    <div class="hint">安全提示：支持加盐 scrypt 强哈希防护与多级防爆破退避</div>
+    <div class="hint">安全提示：支持一次性二维码配对、设备独立撤销与加盐 scrypt 强哈希防护</div>
   </div>
   <script>
     (function(){
@@ -700,6 +792,44 @@ function loginPage(errorText, lockedSec) {
       }
     })();
   </script>
+</body>
+</html>`;
+}
+
+function pairErrorPage(msg) {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>配对失效 - DSH 远程网关</title>
+  <style>
+    body {
+      margin: 0; min-height: 100vh; background: #f8fafc;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex; align-items: center; justify-content: center; padding: 20px;
+    }
+    .card {
+      max-width: 360px; width: 100%; background: #ffffff; border: 1px solid #e2e8f0;
+      border-radius: 20px; padding: 32px 24px; text-align: center;
+      box-shadow: 0 20px 40px -10px rgba(0,0,0,0.08);
+    }
+    .icon { font-size: 40px; margin-bottom: 12px; }
+    h1 { font-size: 18px; margin: 0 0 8px; color: #0f172a; }
+    p { font-size: 13px; color: #64748b; line-height: 1.5; margin: 0 0 20px; }
+    a {
+      display: inline-block; background: #0284c7; color: #fff; text-decoration: none;
+      padding: 10px 20px; border-radius: 10px; font-size: 13px; font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">⌛</div>
+    <h1>配对链接已失效</h1>
+    <p>${msg || '该一次性配对令牌已过期或已被使用。为保障安全，请在电脑端重新刷新二维码后再次扫码。'}</p>
+    <a href="/__gw/login">前往普通口令登录</a>
+  </div>
 </body>
 </html>`;
 }
@@ -808,6 +938,31 @@ async function qrPngBuffer(text) {
   return qrcodeLib.toBuffer(text, { width: 360, margin: 2, errorCorrectionLevel: 'M' });
 }
 
+// 检查是否为合法的受信任 Origin (CORS 白名单)
+function isTrustedOrigin(origin) {
+  if (!origin) return false;
+  try {
+    const u = new URL(origin);
+    const host = u.hostname;
+    // 1. 本机与回环
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return true;
+    // 2. 局域网私网
+    if (isPrivateLanIp(host)) return true;
+    // 3. remotes.json 中配置的合法远程域
+    try {
+      if (fs.existsSync(REMOTES_FILE)) {
+        const s = JSON.parse(fs.readFileSync(REMOTES_FILE, 'utf8'));
+        if (s && Array.isArray(s.remotes)) {
+          if (s.remotes.some((r) => r && r.baseUrl && new URL(r.baseUrl).origin === origin)) {
+            return true;
+          }
+        }
+      }
+    } catch {}
+  } catch {}
+  return false;
+}
+
 // ---- HTTP 服务核心路由调度 ----
 const server = http.createServer(async (req, res) => {
   try {
@@ -815,48 +970,134 @@ const server = http.createServer(async (req, res) => {
     const clientIp = getClientIp(req);
     const ua = req.headers['user-agent'] || '';
 
-    // CORS 支持: 允许来自 DSH Web (如 127.0.0.1:3080) 或外网控制面的管理请求
+    // CORS 支持: 仅在受信任的 Origin 列表里才放行，杜绝泛反射
     if (url.pathname.startsWith('/__gw/')) {
       const origin = req.headers.origin;
-      if (origin) {
+      if (origin && isTrustedOrigin(origin)) {
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Access-Control-Allow-Credentials', 'true');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
       }
       if (req.method === 'OPTIONS') {
-        res.writeHead(204);
+        res.writeHead(origin && isTrustedOrigin(origin) ? 204 : 403);
         res.end();
         return;
       }
     }
 
-    // 扫码免密/URL 带密码直通鉴权: 支持 ?key=<password> 或 ?p=<password> 或 ?password=<password>
-    const queryKey = url.searchParams.get('key') || url.searchParams.get('p') || url.searchParams.get('password');
-    if (queryKey && req.method === 'GET') {
-      const limit = checkRateLimit(clientIp);
-      if (!limit.allowed) {
-        res.writeHead(429, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-        res.end(loginPage(`尝试失败次数过多，已被临时锁定，请等待 ${limit.remainSec} 秒后再试`, limit.remainSec));
-        appendAccessLog({ ip: clientIp, method: req.method, path: url.pathname, status: 'RATE_LIMIT', ua, note: `token locked remain ${limit.remainSec}s` });
+    // ==========================================
+    // 核心安全功能 1: 一次性 Pairing Token 配对消费端点
+    // ==========================================
+    if (url.pathname === '/__gw/pair' && req.method === 'GET') {
+      const token = url.searchParams.get('t');
+      const record = consumePairingToken(token);
+
+      if (!record) {
+        appendAccessLog({ ip: clientIp, method: 'GET', path: '/__gw/pair', status: 'PAIR_INVALID', ua, note: 'token expired or reused' });
+        res.writeHead(400, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(pairErrorPage('该配对二维码已失效或已被使用，请在电脑端刷新后重新扫码。'));
         return;
       }
 
-      if (verifyPassword(queryKey, passwordHash)) {
-        resetLoginFailure(clientIp);
-        setLoginCookies(res, isReqHttps(req));
-        appendAccessLog({ ip: clientIp, method: req.method, path: url.pathname, status: 'TOKEN_LOGIN_OK', ua });
-        const tok = loadDshToken();
-        res.writeHead(303, { location: tok ? `/?token=${tok}` : '/', 'cache-control': 'no-store' });
-        res.end();
-        return;
-      } else {
-        recordLoginFailure(clientIp);
-        appendAccessLog({ ip: clientIp, method: req.method, path: url.pathname, status: 'TOKEN_LOGIN_FAIL', ua, note: 'invalid key param' });
-      }
+      // 生成独立设备专属 Token (32 字节高熵随机器)
+      const deviceRawToken = crypto.randomBytes(32).toString('base64url');
+      const deviceId = 'dev_' + Date.now().toString(36) + Math.floor(Math.random() * 0x1000).toString(36);
+      const deviceName = parseDeviceName(ua);
+      const devices = loadDevices();
+
+      const newDevice = {
+        id: deviceId,
+        name: deviceName,
+        tokenHash: hashToken(deviceRawToken),
+        createdIp: clientIp,
+        createdAt: new Date().toISOString(),
+        lastActiveAt: new Date().toISOString(),
+        lastIp: clientIp,
+        status: 'active',
+        ua,
+      };
+
+      devices.push(newDevice);
+      saveDevices(devices);
+
+      // 种入专属 HttpOnly 设备凭证 Cookie，并代签 DSH 访问凭证
+      setDeviceCookies(res, deviceRawToken, isReqHttps(req));
+      appendAccessLog({ ip: clientIp, method: 'GET', path: '/__gw/pair', status: 'PAIR_SUCCESS', ua, note: `paired device: ${deviceName} (${deviceId})` });
+
+      const tok = loadDshToken();
+      // 303 跳转进入纯净根路径
+      res.writeHead(303, { location: tok ? `/?token=${tok}` : '/', 'cache-control': 'no-store' });
+      res.end();
+      return;
     }
 
-    // 登录页面 & 提交验证
+    // ==========================================
+    // 核心安全功能 2: 生成一次性 Pairing Token (受限)
+    // ==========================================
+    if (url.pathname === '/__gw/pair/create' && (req.method === 'POST' || req.method === 'GET')) {
+      if (!allowed(req)) {
+        res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+        return;
+      }
+      const pairRec = createPairingToken();
+      appendAccessLog({ ip: clientIp, method: req.method, path: '/__gw/pair/create', status: 'PAIR_CREATED', ua });
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({
+        ok: true,
+        token: pairRec.token,
+        expiresAt: pairRec.expiresAt,
+        ttlSeconds: 90,
+      }));
+      return;
+    }
+
+    // ==========================================
+    // 核心安全功能 3: 独立设备管理接口 (查询、撤销、重命名)
+    // ==========================================
+    if (url.pathname === '/__gw/devices') {
+      if (!allowed(req)) {
+        res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+        return;
+      }
+      const devices = loadDevices();
+      // 脱敏输出，不泄露 tokenHash
+      const safeList = devices.map(({ tokenHash, ...safe }) => safe);
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ ok: true, devices: safeList }));
+      return;
+    }
+
+    if (url.pathname === '/__gw/devices/revoke' && req.method === 'POST') {
+      if (!allowed(req)) {
+        res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+        return;
+      }
+      let body;
+      try { body = JSON.parse(await readBody(req)); } catch { body = {}; }
+      const deviceId = String(body.deviceId || '').trim();
+      if (!deviceId) {
+        res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'missing deviceId' }));
+        return;
+      }
+      const devices = loadDevices();
+      const hit = devices.find((d) => d.id === deviceId);
+      if (hit) {
+        hit.status = 'revoked';
+        hit.revokedAt = new Date().toISOString();
+        saveDevices(devices);
+        appendAccessLog({ ip: clientIp, method: 'POST', path: '/__gw/devices/revoke', status: 'DEVICE_REVOKED', ua, note: `revoked deviceId: ${deviceId}` });
+      }
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ ok: true, deviceId }));
+      return;
+    }
+
+    // 普通密码登录页面 & 提交验证 (作为应急后备手段)
     if (url.pathname === '/__gw/login') {
       if (req.method === 'POST') {
         const limit = checkRateLimit(clientIp);
@@ -914,7 +1155,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 口令修改
+    // 重设口令 (仅存 scrypt 哈希，不留任何明文)
     if (url.pathname === '/__gw/password') {
       if (req.method !== 'POST') {
         res.writeHead(405, { 'content-type': 'application/json; charset=utf-8' });
@@ -939,56 +1180,11 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ ok: false, error: '口令长度需 6-128 位' }));
         return;
       }
-      persistSecret(pw);
+      persistPasswordHash(pw);
       sessions.clear();
       appendAccessLog({ ip: clientIp, method: 'POST', path: '/__gw/password', status: 'PASSWORD_CHANGED', ua });
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
       res.end(JSON.stringify({ ok: true }));
-      return;
-    }
-
-    // 口令明文查看
-    if (url.pathname === '/__gw/reveal') {
-      if (req.method !== 'POST' && req.method !== 'GET') {
-        res.writeHead(405, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: false, error: 'GET or POST only' }));
-        return;
-      }
-      if (!allowed(req)) {
-        res.writeHead(403, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-        res.end(JSON.stringify({ ok: false, error: '请先登录后再查看' }));
-        return;
-      }
-      const secret = loadSecret();
-      if (!secret) {
-        res.writeHead(500, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-        res.end(JSON.stringify({ ok: false, error: '口令库不可读' }));
-        return;
-      }
-      appendAccessLog({ ip: clientIp, method: req.method, path: '/__gw/reveal', status: 'PASSWORD_REVEALED', ua });
-      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-      res.end(JSON.stringify({ ok: true, password: secret }));
-      return;
-    }
-
-    // 随机轮换口令
-    if (url.pathname === '/__gw/rotate') {
-      if (req.method !== 'POST' && req.method !== 'GET') {
-        res.writeHead(405, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: false, error: 'GET or POST only' }));
-        return;
-      }
-      if (!allowed(req)) {
-        res.writeHead(403, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-        res.end(JSON.stringify({ ok: false, error: '请先登录后再更换' }));
-        return;
-      }
-      const fresh = makePassword(12);
-      persistSecret(fresh);
-      sessions.clear();
-      appendAccessLog({ ip: clientIp, method: req.method, path: '/__gw/rotate', status: 'PASSWORD_ROTATED', ua });
-      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-      res.end(JSON.stringify({ ok: true, password: fresh }));
       return;
     }
 
@@ -1058,7 +1254,6 @@ const server = http.createServer(async (req, res) => {
         port3080CheckedIp: exposure.checkedIp,
         direct: !gwConfig.lanAuth && isDirectClient,
         authed: hasSession(req),
-        password: isLocalHost ? (loadSecret() || '') : undefined,
         dshCosign: !!dshSecret,
         time: new Date().toISOString(),
       }));
@@ -1118,6 +1313,6 @@ server.on('upgrade', (req, socket, head) => {
 
 server.on('clientError', (_err, socket) => socket.destroy());
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[gw] listen 0.0.0.0:${PORT} -> ${UP_HOST}:${UP_PORT} (CIDR protection active)`);
+  console.log(`[gw] listen 0.0.0.0:${PORT} -> ${UP_HOST}:${UP_PORT} (Pairing & Device token engine ready)`);
 });
 process.on('SIGTERM', () => server.close(() => process.exit(0)));

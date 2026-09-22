@@ -1,0 +1,8 @@
+# dsh-gateway-ctl: self-written remote gateway controller.
+# Inserts the single host-side plugin row that manages the standalone
+# gateway process (port 3081 -> DSH 127.0.0.1:3080) and its Cloudflare
+# Quick Tunnel, and registers the gw_gateway model tool.
+
+- insert:
+    - id: gateway-ctl
+      name: 'dsh-gateway-ctl'

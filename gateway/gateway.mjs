@@ -142,6 +142,10 @@ function mergeSetCookie(headers, extra) {
   else out['set-cookie'] = [prev, extra];
   return out;
 }
+function isReqHttps(req) {
+  return (req.headers && req.headers['x-forwarded-proto'] === 'https') || !!(req.socket && req.socket.encrypted);
+}
+
 // 登录成功后同时种下 DSH cookie(两个 Set-Cookie), 浏览器直达 DSH, 不再弹 token 页
 function setLoginCookies(res, secure) {
   const tok = crypto.randomBytes(32).toString('hex');
@@ -231,16 +235,16 @@ function loginPage(error) {
   <title>DSH 远程网关验证</title>
   <style>
     :root {
-      --bg: #090b10;
-      --card-bg: rgba(18, 22, 34, 0.85);
-      --border: rgba(255, 255, 255, 0.1);
-      --border-focus: #3b82f6;
-      --text-primary: #f3f4f6;
-      --text-secondary: #9ca3af;
-      --brand: #3b82f6;
-      --brand-hover: #2563eb;
+      --bg: #f8fafc;
+      --card-bg: #ffffff;
+      --border: #e2e8f0;
+      --border-focus: #0284c7;
+      --text-primary: #0f172a;
+      --text-secondary: #64748b;
+      --brand: #0284c7;
+      --brand-hover: #0369a1;
       --error: #ef4444;
-      --error-bg: rgba(239, 68, 68, 0.12);
+      --error-bg: #fef2f2;
     }
     * { box-sizing: border-box; }
     body {
@@ -248,8 +252,8 @@ function loginPage(error) {
       min-height: 100vh;
       background: var(--bg);
       background-image: 
-        radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.15) 0%, transparent 60%),
-        radial-gradient(circle at 100% 100%, rgba(99, 102, 241, 0.08) 0%, transparent 40%);
+        radial-gradient(circle at 50% 0%, rgba(14, 165, 233, 0.15) 0%, transparent 65%),
+        radial-gradient(circle at 100% 100%, rgba(56, 189, 248, 0.08) 0%, transparent 40%);
       color: var(--text-primary);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
       display: flex;
@@ -261,12 +265,10 @@ function loginPage(error) {
       width: 100%;
       max-width: 380px;
       background: var(--card-bg);
-      backdrop-filter: blur(24px);
-      -webkit-backdrop-filter: blur(24px);
       border: 1px solid var(--border);
       border-radius: 20px;
       padding: 36px 28px;
-      box-shadow: 0 24px 64px -12px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.05);
+      box-shadow: 0 20px 45px -10px rgba(14, 116, 144, 0.12), 0 0 0 1px rgba(226, 232, 240, 0.6);
       text-align: center;
       animation: fadeIn 0.3s ease-out;
     }
@@ -278,19 +280,20 @@ function loginPage(error) {
       width: 52px;
       height: 52px;
       margin: 0 auto 16px;
-      background: linear-gradient(135deg, rgba(59, 130, 246, 0.2), rgba(99, 102, 241, 0.2));
-      border: 1px solid rgba(59, 130, 246, 0.3);
+      background: #f0f9ff;
+      border: 1px solid #bae6fd;
       border-radius: 14px;
       display: flex;
       align-items: center;
       justify-content: center;
-      color: #60a5fa;
-      box-shadow: 0 8px 16px -4px rgba(59, 130, 246, 0.2);
+      color: #0284c7;
+      box-shadow: 0 6px 16px -4px rgba(2, 132, 199, 0.2);
     }
     h1 {
       margin: 0 0 6px;
       font-size: 20px;
       font-weight: 600;
+      color: var(--text-primary);
       letter-spacing: -0.02em;
     }
     p {
@@ -301,7 +304,7 @@ function loginPage(error) {
     }
     .alert {
       background: var(--error-bg);
-      border: 1px solid rgba(239, 68, 68, 0.25);
+      border: 1px solid #fecdd3;
       color: var(--error);
       padding: 9px 12px;
       border-radius: 10px;
@@ -325,8 +328,8 @@ function loginPage(error) {
     }
     input {
       width: 100%;
-      background: rgba(10, 13, 20, 0.7);
-      border: 1px solid var(--border);
+      background: #f8fafc;
+      border: 1px solid #cbd5e1;
       color: var(--text-primary);
       border-radius: 12px;
       padding: 12px 46px 12px 14px;
@@ -335,8 +338,9 @@ function loginPage(error) {
       transition: all 0.2s;
     }
     input:focus {
+      background: #ffffff;
       border-color: var(--border-focus);
-      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+      box-shadow: 0 0 0 3px rgba(2, 132, 199, 0.2);
     }
     .pw-toggle {
       position: absolute;
@@ -364,21 +368,21 @@ function loginPage(error) {
       border-radius: 12px;
       padding: 12px;
       font-size: 15px;
-      font-weight: 500;
+      font-weight: 600;
       cursor: pointer;
-      box-shadow: 0 4px 12px rgba(59, 130, 246, 0.35);
+      box-shadow: 0 4px 14px rgba(2, 132, 199, 0.35);
       transition: all 0.2s;
     }
     button.submit:hover {
       background: var(--brand-hover);
-      box-shadow: 0 6px 18px rgba(59, 130, 246, 0.45);
+      box-shadow: 0 6px 18px rgba(2, 132, 199, 0.45);
       transform: translateY(-1px);
     }
     button.submit:active { transform: translateY(0); }
     .hint {
       margin-top: 20px;
       font-size: 12px;
-      color: #6b7280;
+      color: #94a3b8;
       line-height: 1.4;
     }
   </style>
@@ -589,6 +593,26 @@ const server = http.createServer(async (req, res) => {
         return;
       }
     }
+
+    // 扫码免密/URL 带密码直通鉴权: 支持 ?key=<password> 或 ?p=<password> 或 ?password=<password>
+    const checkKeyAuth = (inputKey) => {
+      if (!inputKey || !passwordHash) return false;
+      try {
+        const inputHash = Buffer.from(sha256hex(inputKey), 'hex');
+        const realHash = Buffer.from(passwordHash, 'hex');
+        return inputHash.length === realHash.length && crypto.timingSafeEqual(inputHash, realHash);
+      } catch { return false; }
+    };
+
+    const queryKey = url.searchParams.get('key') || url.searchParams.get('p') || url.searchParams.get('password');
+    if (queryKey && req.method === 'GET' && checkKeyAuth(queryKey)) {
+      setLoginCookies(res, isReqHttps(req));
+      const tok = loadDshToken();
+      // 登录成功直接跳转到纯净的根路径, 避免密码滞留在手机浏览器历史和地址栏中
+      res.writeHead(303, { location: tok ? `/?token=${tok}` : '/', 'cache-control': 'no-store' });
+      res.end();
+      return;
+    }
     if (url.pathname === '/__gw/login') {
       if (req.method === 'POST') {
         let body = '';
@@ -597,7 +621,7 @@ const server = http.createServer(async (req, res) => {
         const ok = passwordHash &&
           crypto.timingSafeEqual(Buffer.from(sha256hex(pw), 'hex'), Buffer.from(passwordHash, 'hex'));
         if (ok) {
-          setLoginCookies(res, !isDirect(req));
+          setLoginCookies(res, isReqHttps(req));
           // DSH cookie 已代签, 直接进根路径; 极少数密钥轮换时 DSH 会再跳 token 页, 用户手动补一次即可
           const tok = loadDshToken();
           res.writeHead(303, { location: tok ? `/?token=${tok}` : '/', 'cache-control': 'no-store' });

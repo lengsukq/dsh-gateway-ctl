@@ -36,10 +36,11 @@ function loadConfig() {
     const raw = fs.readFileSync(CONFIG_FILE, 'utf8');
     const parsed = JSON.parse(raw);
     return {
-      lanAuth: Boolean(parsed && parsed.lanAuth), // 是否强制局域网验证口令
+      // 默认开启局域网密码保护，除非用户在 config.json 明确设为 false
+      lanAuth: parsed && typeof parsed.lanAuth === 'boolean' ? parsed.lanAuth : true,
     };
   } catch {
-    return { lanAuth: false };
+    return { lanAuth: true };
   }
 }
 

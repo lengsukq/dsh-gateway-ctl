@@ -573,6 +573,22 @@ function proxyUpgrade(req, socket, head) {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || '/', 'http://gw.invalid');
+
+    // CORS 支持: 允许来自 DSH Web (如 127.0.0.1:3080) 或外网控制面的管理请求
+    if (url.pathname.startsWith('/__gw/')) {
+      const origin = req.headers.origin;
+      if (origin) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      }
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+    }
     if (url.pathname === '/__gw/login') {
       if (req.method === 'POST') {
         let body = '';
@@ -642,9 +658,9 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/__gw/reveal') {
       // 取回当前口令明文: 局域网直连(可信内网)或已登录 session 可调
-      if (req.method !== 'POST') {
+      if (req.method !== 'POST' && req.method !== 'GET') {
         res.writeHead(405, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: false, error: 'POST only' }));
+        res.end(JSON.stringify({ ok: false, error: 'GET or POST only' }));
         return;
       }
       if (!allowed(req)) {
@@ -664,9 +680,9 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/__gw/rotate') {
       // 随机生成并立即更换口令: 局域网直连(可信内网)或已登录 session 可调
-      if (req.method !== 'POST') {
+      if (req.method !== 'POST' && req.method !== 'GET') {
         res.writeHead(405, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: false, error: 'POST only' }));
+        res.end(JSON.stringify({ ok: false, error: 'GET or POST only' }));
         return;
       }
       if (!allowed(req)) {
@@ -689,6 +705,7 @@ const server = http.createServer(async (req, res) => {
         upstream: `${UP_HOST}:${UP_PORT}`,
         direct: isDirect(req),
         authed: hasSession(req),
+        password: isDirect(req) ? (loadSecret() || '') : undefined,
         dshCosign: !!dshSecret,
         time: new Date().toISOString(),
       }));

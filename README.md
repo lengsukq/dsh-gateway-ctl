@@ -32,17 +32,43 @@ DSH 本体 127.0.0.1:3080 (完全不动)
 # 1. 装插件包到 DSH profile（link 方式，改代码即生效）
 dsh plugin --profile web add link:/path/to/dsh-gateway-ctl
 
-# 2. 放网关脚本（本仓库 gateway/ 目录）到 ~/.dsh/gateway，并装二维码依赖
-mkdir -p ~/.dsh/gateway
-cp gateway/gateway.mjs gateway/gw.sh ~/.dsh/gateway/
-cd ~/.dsh/gateway && npm i qrcode
-chmod +x gw.sh
-
-# 3. 启动网关（首次启动会自动生成随机口令，打在 gateway.log 的 FIRST_START_PASSWORD 里）
-./gw.sh start
-
-# 4. 重启 DSH Web，侧栏底部会出现手机图标
+# 2. 重启 DSH Web —— 网关会在 DSH 启动后自动拉起（见下方「开机自启」）
 ```
+
+插件首次启动时会把仓库里的 `gateway/gateway.mjs`、`gateway/gw.sh` 自动部署到 `~/.dsh/gateway`
+（仅在缺失或仓库版本更新时覆盖，本地改过的副本保留），并补一个只含 `qrcode` 依赖的
+`package.json`。如果机器上还没有二维码依赖，补装一次即可：
+
+```bash
+cd ~/.dsh/gateway && npm i qrcode
+```
+
+需要手动控制时仍然可以直接用脚本（首次启动会自动生成随机口令，打在 `gateway.log` 的
+`FIRST_START_PASSWORD` 里）：
+
+```bash
+cd ~/.dsh/gateway && ./gw.sh start|stop|restart|status|qr
+```
+
+### 开机自启
+
+DSH 启动完成（Web 服务就绪）后，插件探测 `127.0.0.1:3081`：
+
+- 已经在跑 → 什么都不做（网关是 `nohup` 独立进程，DSH 重启不会带走它）
+- 没在跑 → 自动执行 `gw.sh start`，需要时同时拉起 Quick Tunnel
+
+关闭自启：`DSH_GW_AUTOSTART=0 dsh ...`，或在 profile 的 `cordis.patch.yml` 里给
+`gateway-ctl` 行加 `config: { autoStart: false }`。每次开机/重启 DSH 的自启结果会追加到
+`~/.dsh/gateway/plugin.log`。
+
+### 环境变量
+
+| 变量 | 作用 |
+|---|---|
+| `DSH_GW_AUTOSTART=0` | 关闭 DSH 启动时自动拉起网关 |
+| `DSH_GW_DIR` | 网关运行目录（默认 `~/.dsh/gateway`），插件与网关脚本都读它 |
+| `DSH_GW_QRCODE` | 指定 `qrcode` 模块（包名或绝对路径），默认依次从插件自身、网关目录解析 |
+| `GW_PORT` | 网关端口，默认 `3081` |
 
 ## 使用
 
@@ -90,15 +116,19 @@ dsh-gateway-ctl/
 ├── package.json        # dsh.bundle.patch + dsh.client 声明
 ├── cordis.patch.yml    # 往 profile 插入 gateway-ctl 行
 ├── lib/
-│   ├── index.js        # Host: gw_gateway 工具 + /api/gw/* 路由 + 地址表 CRUD
+│   ├── index.js        # Host: gw_gateway 工具 + /api/gw/* 路由 + 地址表 CRUD + 启动自启
 │   └── client.js       # Client: 侧栏入口 + 扫码/地址/设置三 Tab 弹框（无构建，直写）
 └── gateway/
     ├── gateway.mjs     # 独立网关：反代 + 分流鉴权 + DSH 代签 + 登录页 + 二维码接口
     └── gw.sh           # 启停脚本（按选中地址自动决定起不起 Quick Tunnel）
+
+运行期目录 ~/.dsh/gateway/ 里由插件维护: gateway.mjs / gw.sh（自动部署）,
+plugin.log（自启诊断）, remotes.json（地址表）, gateway.pid / tunnel.pid。
 ```
 
 ## 已知限制
 
 - 本地 DNS 污染环境下 `*.trycloudflare.com` 可能打不开（运营商 SNI 阻断/NXDOMAIN），优先用固定域名
 - `198.18.0.1` 这类代理 tun 口地址访问本地网关会被系统网络层吃掉，用 `127.0.0.1` 或 LAN IP
-- 网关/隧道是独立进程，整机重启后需 `gw.sh start`（可自行配 launchd 自启）
+- 自启只在 **DSH 启动时** 发生：整机重启后如果没启动 DSH，网关也不会在跑；要真正做到开机即用，另配 launchd
+  LaunchAgent（`dsh web` + `gw.sh start`）或用固定域名 + Cloudflare Tunnel 常驻服务

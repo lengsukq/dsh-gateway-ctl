@@ -10,6 +10,18 @@ TN_PID="$DIR/tunnel.pid"
 
 gw_port() { echo "${GW_PORT:-3081}"; }
 
+# pid 文件里的进程是否真的还在跑(可带命令行特征), 避免陈旧 pid 或 pid 复用误判"已在运行"
+pid_running() {
+  local pid_file="$1" marker="${2:-}" pid
+  pid="$(cat "$pid_file" 2>/dev/null || true)"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [ -n "$marker" ]; then
+    ps -p "$pid" -o command= 2>/dev/null | grep -q -- "$marker" || return 1
+  fi
+  return 0
+}
+
 # 自定义地址选中时跳过 Quick Tunnel: 有 activeId 且对应地址存在 => 不起隧道
 needs_quick_tunnel() {
   node -e "
@@ -32,7 +44,7 @@ kill_tunnel() {
 
 do_start() {
   mkdir -p "$DIR"
-  if [ -f "$GW_PID" ] && kill -0 "$(cat "$GW_PID")" 2>/dev/null; then
+  if pid_running "$GW_PID" "gateway.mjs"; then
     echo "gateway already running (pid $(cat "$GW_PID"))"
   else
     [ -z "${GW_PASSWORD:-}" ] && [ ! -f "$DIR/.gw_password" ] && echo "提示: 首次启动将自动生成随机口令, 见 gateway.log 的 FIRST_START_PASSWORD"
@@ -44,7 +56,7 @@ do_start() {
     echo
   fi
   if needs_quick_tunnel; then
-    if [ -f "$TN_PID" ] && kill -0 "$(cat "$TN_PID")" 2>/dev/null; then
+    if pid_running "$TN_PID" "cloudflared"; then
       echo "tunnel already running (pid $(cat "$TN_PID"))"
     else
       nohup cloudflared tunnel --url "http://127.0.0.1:$(gw_port)" --no-autoupdate >> "$TN_LOG" 2>&1 &
@@ -74,10 +86,10 @@ do_stop() {
 
 do_status() {
   echo "--- gateway ---"
-  ([ -f "$GW_PID" ] && kill -0 "$(cat "$GW_PID")" 2>/dev/null && echo "running (pid $(cat "$GW_PID"))") || echo "stopped"
+  if pid_running "$GW_PID" "gateway.mjs"; then echo "running (pid $(cat "$GW_PID"))"; else echo "stopped"; fi
   curl -s "http://127.0.0.1:$(gw_port)/__gw/status" 2>/dev/null || echo "(no local response)"
   echo; echo "--- tunnel ---"
-  ([ -f "$TN_PID" ] && kill -0 "$(cat "$TN_PID")" 2>/dev/null && echo "running (pid $(cat "$TN_PID"))") || echo "stopped"
+  if pid_running "$TN_PID" "cloudflared"; then echo "running (pid $(cat "$TN_PID"))"; else echo "stopped"; fi
   [ -f "$DIR/tunnel.url" ] && { echo -n "URL: "; cat "$DIR/tunnel.url"; echo; }
 }
 

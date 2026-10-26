@@ -1,6 +1,6 @@
 {
   "name": "dsh-gateway-ctl",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Self-written remote gateway controller for DSH web: manages the standalone gateway process (port 3081) and its Cloudflare Quick Tunnel. No third-party remote plugin required.",
   "type": "module",
   "main": "lib/index.js",
@@ -9,7 +9,7 @@
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
-  "files": ["lib/**/*.js", "cordis.patch.yml"],
+  "files": ["lib/**/*.js", "gateway/**/*", "cordis.patch.yml"],
   "license": "MIT",
   "dsh": {
     "bundle": {

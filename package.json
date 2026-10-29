@@ -5,14 +5,18 @@
   "type": "module",
   "main": "lib/index.js",
   "scripts": {
-    "test": "node gateway/selftest.mjs"
+    "test": "node gateway/selftest.mjs && node test/plugin-selftest.mjs"
   },
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
-  "files": ["lib/**/*.js", "gateway/**/*", "cordis.patch.yml"],
+  "files": [
+    "lib/**/*.js",
+    "gateway/**/*",
+    "cordis.patch.yml"
+  ],
   "license": "MIT",
   "dsh": {
     "bundle": {

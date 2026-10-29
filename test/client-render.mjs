@@ -137,9 +137,12 @@ const expectations = {
   qr: ['公网远程访问', '局域网直连 (扫码配对)', '复制一次性配对链接', '/__gw/pair?t=pairTok123'],
   remotes: ['管理用于外网访问的域名', '我的'],
   settings: [
-    '凭证与密钥（持久化）', '访问策略与局域网入口', '撤销全部设备', 'Android · Chrome', 'IP 来源:',
+    '设备', '活跃 3', '已失效 1', '撤销全部',
+    '访问策略', '全部来源需登录', '3080 仅本机', '入口 2',
+    '凭证与密钥', '轮换密钥', '强制重登',
+    '主口令', '审计日志',
+    'Android · Chrome', '2 台',
     '192.168.31.193 · 局域网', '10.0.111.2 · 组网/代理', '203.0.113.9 · 公网', '127.0.0.1 · 本机',
-    '已失效 1 台', '全部来源需登录', '轮换内部密钥', '2 台',
   ],
 };
 
@@ -151,6 +154,7 @@ for (const tab of Object.keys(expectations)) {
     const tree = PanelType({ onClose: () => {} });
     if (process.env.GW_DUMP_HOOKS === tab) console.log(hookLog.map((x) => x.join(':')).join(' '));
     const joined = collectText(tree).join(' | ');
+    if (process.env.GW_DUMP_TEXT === tab) console.log(joined);
     const missing = expectations[tab].filter((m) => !joined.includes(m));
     if (missing.length) {
       console.error(`✗ tab=${tab}: 缺少 ${JSON.stringify(missing)}\n  实际片段: ${joined.slice(0, 500)}`);

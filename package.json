@@ -1,9 +1,12 @@
 {
   "name": "dsh-gateway-ctl",
-  "version": "0.2.0",
-  "description": "Self-written remote gateway controller for DSH web: manages the standalone gateway process (port 3081) and its Cloudflare Quick Tunnel. No third-party remote plugin required.",
+  "version": "0.3.0",
+  "description": "Self-written remote gateway controller for DSH web: uniform credential gate on port 3081 (no IP-based free access), persisted keys/sessions/devices, paired-device fingerprints, and Cloudflare tunnel management.",
   "type": "module",
   "main": "lib/index.js",
+  "scripts": {
+    "test": "node gateway/selftest.mjs"
+  },
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",

@@ -38,8 +38,18 @@ const COOKIE_NAME = 'gw_session';
 const DEVICE_COOKIE_NAME = 'gw_device';
 const UP_ORIGIN = `http://${UP_HOST}:${UP_PORT}`;
 const DAY_MS = 24 * 3600 * 1000;
+const BUILD_ID = String(process.env.GW_BUILD_ID || 'dev').slice(0, 24);
+const REQUIRE_HTTPS = ['1', 'true', 'yes', 'on'].includes(String(process.env.GW_REQUIRE_HTTPS || '').trim().toLowerCase());
+const ADMIN_HEADER = 'x-gw-admin';
+const CSRF_HEADER = 'x-gw-request';
+const AUTH_HEADER = 'x-gw-auth';
 
 fs.mkdirSync(DIR, { recursive: true });
+
+// 审计日志含来源 IP / 路径, 只允许本用户读取
+try {
+  if (fs.existsSync(ACCESS_LOG_FILE)) fs.chmodSync(ACCESS_LOG_FILE, 0o600);
+} catch {}
 
 // ---- 安全擦除历史明文密码文件 (.gw_secret) ----
 function secureShredFile(filePath) {
@@ -488,43 +498,85 @@ function getClientIp(req) {
   return peer || 'unknown';
 }
 
-// ---- 防暴力破解限流器 (RateLimiter) ----
-const failedAttempts = new Map();
+// ---- 防暴力破解限流器: 三层桶 (client / peer / global) ----
+// client 桶按客户端 IP, 转发头可被代理侧伪造; peer 桶按 socket 对端地址, 不可伪造;
+// global 桶兜住"每次换一个 IP"的分布式尝试。任一层锁定即拒绝登录。
+const RATE_LIMITS = {
+  client: { threshold: 5, delays: [30, 60, 120, 300, 900] },
+  peer: { threshold: 15, delays: [60, 120, 300, 600, 1800] },
+};
+const rateBuckets = { client: new Map(), peer: new Map() };
+const GLOBAL_WINDOW_MS = 10 * 60 * 1000;
+const GLOBAL_THRESHOLD = 60;
+const GLOBAL_LOCK_MS = 5 * 60 * 1000;
+let globalRate = { windowStart: 0, count: 0, lockedUntil: 0 };
 
-function checkRateLimit(ip) {
-  const record = failedAttempts.get(ip);
+function bucketState(scope, key) {
+  if (!key) return { allowed: true };
+  const record = rateBuckets[scope].get(key);
   if (!record) return { allowed: true };
   if (record.lockedUntil && record.lockedUntil > Date.now()) {
-    const remainSec = Math.ceil((record.lockedUntil - Date.now()) / 1000);
-    return { allowed: false, remainSec };
+    return { allowed: false, remainSec: Math.ceil((record.lockedUntil - Date.now()) / 1000), scope };
   }
   return { allowed: true };
 }
 
-function recordLoginFailure(ip) {
-  const now = Date.now();
-  const record = failedAttempts.get(ip) || { count: 0, lockedUntil: 0 };
-  record.count += 1;
-  if (record.count >= 5) {
-    const exponent = Math.min(record.count - 5, 4);
-    const delays = [30, 60, 120, 300, 900];
-    const delaySec = delays[exponent];
-    record.lockedUntil = now + delaySec * 1000;
+function checkLoginAllowed({ clientIp, peerIp }) {
+  for (const [scope, key] of [['peer', peerIp], ['client', clientIp]]) {
+    const state = bucketState(scope, key);
+    if (!state.allowed) return state;
   }
-  failedAttempts.set(ip, record);
+  const now = Date.now();
+  if (globalRate.lockedUntil && globalRate.lockedUntil > now) {
+    return { allowed: false, remainSec: Math.ceil((globalRate.lockedUntil - now) / 1000), scope: 'global' };
+  }
+  return { allowed: true };
 }
 
-function resetLoginFailure(ip) {
-  failedAttempts.delete(ip);
+function bumpBucket(scope, key) {
+  if (!key) return;
+  const cfg = RATE_LIMITS[scope];
+  const map = rateBuckets[scope];
+  const record = map.get(key) || { count: 0, lockedUntil: 0, lastAt: 0 };
+  record.count += 1;
+  record.lastAt = Date.now();
+  if (record.count >= cfg.threshold) {
+    const exponent = Math.min(record.count - cfg.threshold, cfg.delays.length - 1);
+    record.lockedUntil = Date.now() + cfg.delays[exponent] * 1000;
+  }
+  map.set(key, record);
+}
+
+function recordLoginFailure({ clientIp, peerIp }) {
+  bumpBucket('client', clientIp);
+  bumpBucket('peer', peerIp);
+  const now = Date.now();
+  if (!globalRate.windowStart || now - globalRate.windowStart > GLOBAL_WINDOW_MS) {
+    globalRate = { windowStart: now, count: 0, lockedUntil: globalRate.lockedUntil || 0 };
+  }
+  globalRate.count += 1;
+  if (globalRate.count >= GLOBAL_THRESHOLD) {
+    globalRate.lockedUntil = now + GLOBAL_LOCK_MS;
+    globalRate.windowStart = now;
+    globalRate.count = 0;
+  }
+}
+
+function resetLoginFailure({ clientIp, peerIp }) {
+  if (clientIp) rateBuckets.client.delete(clientIp);
+  if (peerIp) rateBuckets.peer.delete(peerIp);
 }
 
 setInterval(() => {
   const now = Date.now();
-  for (const [ip, rec] of failedAttempts) {
-    if (rec.lockedUntil && rec.lockedUntil <= now && rec.count >= 5) {
-      failedAttempts.delete(ip);
+  for (const scope of ['client', 'peer']) {
+    const map = rateBuckets[scope];
+    for (const [key, rec] of map) {
+      if (rec.lockedUntil && rec.lockedUntil <= now) map.delete(key);
+      else if (!rec.lockedUntil && rec.lastAt && now - rec.lastAt > 60 * 60 * 1000) map.delete(key);
     }
   }
+  if (globalRate.lockedUntil && globalRate.lockedUntil <= now) globalRate.lockedUntil = 0;
 }, 60_000).unref();
 
 // ---- 结构化安全访问审计日志 (access.log) ----
@@ -541,7 +593,7 @@ function appendAccessLog(event) {
       time: new Date().toISOString(),
       ...event,
     });
-    fs.appendFileSync(ACCESS_LOG_FILE, entry + '\n', 'utf8');
+    fs.appendFileSync(ACCESS_LOG_FILE, entry + '\n', { encoding: 'utf8', mode: 0o600 });
   } catch (e) {
     console.error('[gw] log error:', e);
   }
@@ -808,13 +860,23 @@ function parseCookies(req) {
   for (const part of raw.split(';')) {
     const i = part.indexOf('=');
     if (i < 0) continue;
-    out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    const name = part.slice(0, i).trim();
+    if (!name) continue;
+    let decoded = '';
+    try {
+      decoded = decodeURIComponent(part.slice(i + 1).trim());
+    } catch {
+      // 非法百分号编码: 丢弃该 Cookie, 绝不让解析异常冒泡 (未登录者可借此打崩进程)
+      continue;
+    }
+    out[name] = decoded;
   }
   return out;
 }
 
 // 鉴权判定：普通会话 (gw_session) 或 独立设备凭证 (gw_device)，设备凭证强制校验到期
-function hasSession(req) {
+// 返回 'session' | 'device' | null, 供管理面区分权限
+function sessionState(req) {
   const cookies = parseCookies(req);
 
   // 1. 网页会话 (sessions.json 只保存 token 哈希)
@@ -830,7 +892,7 @@ function hasSession(req) {
           rec.lastSeenAt = new Date(now).toISOString();
           sessionsDirty = true;
         }
-        return true;
+        return 'session';
       }
       sessions.delete(id);
       sessionsDirty = true;
@@ -858,7 +920,7 @@ function hasSession(req) {
           ua: req.headers['user-agent'] || '',
           note: `device ${hit.id}`,
         });
-        return false;
+        return null;
       }
       // 触碰活跃时间 (每 5 分钟更新一次避免频繁写盘)
       const now = Date.now();
@@ -868,11 +930,11 @@ function hasSession(req) {
         hit.lastIp = getClientIp(req);
         saveDevices(devices);
       }
-      return true;
+      return 'device';
     }
   }
 
-  return false;
+  return null;
 }
 
 /**
@@ -880,8 +942,15 @@ function hasSession(req) {
  * 没有按来源 IP 的信任 —— 本机、局域网、组网、隧道、公网同一把尺子.
  */
 function authenticated(req) {
-  return isAdminRequest(req) || hasSession(req);
+  return credentialType(req) !== null;
 }
+
+/** 凭证类型: admin(内部管理密钥) | session(口令登录) | device(扫码设备) | null */
+function credentialType(req) {
+  if (isAdminRequest(req)) return 'admin';
+  return sessionState(req);
+}
+
 
 function wantsJson(req) {
   if (req.url && req.url.startsWith('/api')) return true;
@@ -905,6 +974,8 @@ function clearSessionCookie(res, req) {
   res.setHeader('set-cookie', [
     `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`,
     `${DEVICE_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`,
+    // 一并清掉 DSH 代签 Cookie, 避免登出后仍留一枚 30 天的旁路凭证
+    `${DSH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`,
   ]);
 }
 
@@ -1195,6 +1266,12 @@ function upstreamHeaders(req, incomingHost) {
   }
   h['x-forwarded-host'] = incomingHost;
   h['x-forwarded-proto'] = isReqHttps(req) ? 'https' : 'http';
+  // 内部头一律先剥离再由网关注入, 客户端无法冒充身份
+  delete h[ADMIN_HEADER];
+  delete h[CSRF_HEADER];
+  delete h[AUTH_HEADER];
+  const authType = credentialType(req);
+  if (authType) h[AUTH_HEADER] = authType;
   delete h['proxy-authorization'];
   delete h['proxy-authenticate'];
   if (req.__gwInject) h['accept-encoding'] = 'identity';
@@ -1308,6 +1385,39 @@ function homeRedirect(req, res) {
 }
 
 // 受信任 Origin: 回环 + remotes.json 里精确配置的外网地址 (不再私网通吃)
+/** 本次请求自身的 origin (网关在边缘直接收到原始 Host) */
+function requestOrigin(req) {
+  const host = String(req.headers.host || '').trim();
+  if (!host) return null;
+  return `${isReqHttps(req) ? 'https' : 'http'}://${host}`;
+}
+
+/** Origin/Referer 必须与本次请求同源; 无头 (curl / 脚本) 放行 */
+function originAllowed(req) {
+  const raw = req.headers.origin || req.headers.referer || '';
+  if (!raw) return true;
+  try {
+    return new URL(raw).origin === requestOrigin(req);
+  } catch {
+    return false;
+  }
+}
+
+/** 改动型端点必须带 x-gw-request: 1 (HTML 表单无法设置 -> 跨站 CSRF 直接失效) */
+function csrfHeaderOk(req) {
+  return String(req.headers[CSRF_HEADER] || '') === '1';
+}
+
+const MUTATING_GW_PATHS = new Set([
+  '/__gw/pair/create',
+  '/__gw/password',
+  '/__gw/devices/revoke',
+  '/__gw/config',
+  '/__gw/admin/rotate-key',
+  '/__gw/admin/reload',
+  '/__gw/admin/revoke-sessions',
+]);
+
 function isTrustedOrigin(origin) {
   if (!origin) return false;
   try {
@@ -1388,8 +1498,18 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || '/', 'http://gw.invalid');
     const clientIp = getClientIp(req);
+    const peer = peerIp(req);
     const ua = req.headers['user-agent'] || '';
-    const authed = authenticated(req);
+    const authType = credentialType(req);
+    const authed = authType !== null;
+    const canManage = authType === 'admin' || authType === 'session';
+
+    // 可选强制 HTTPS: 防止 FRP/裸端口把口令与 Cookie 明文暴露在公网
+    if (REQUIRE_HTTPS && !isReqHttps(req) && !isLoopbackPeer(req)) {
+      appendAccessLog({ ip: clientIp, method: req.method, path: url.pathname, status: 'INSECURE_REJECTED', ua, note: 'GW_REQUIRE_HTTPS=1' });
+      sendHtml(res, 426, '<!doctype html><meta charset="utf-8"><title>需要 HTTPS</title><p style="font:14px -apple-system,sans-serif;padding:24px;line-height:1.6">此网关已启用强制 HTTPS：请通过 HTTPS 隧道（Cloudflare Tunnel / 反向代理）访问，避免口令与会话 Cookie 在公网明文传输。</p>');
+      return;
+    }
 
     // CORS 支持: 仅在受信任的 Origin 列表里才放行，杜绝泛反射
     if (url.pathname.startsWith('/__gw/')) {
@@ -1398,11 +1518,25 @@ const server = http.createServer(async (req, res) => {
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Access-Control-Allow-Credentials', 'true');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-gw-admin');
+        res.setHeader('Access-Control-Allow-Headers', `Content-Type, Authorization, ${ADMIN_HEADER}, ${CSRF_HEADER}`);
       }
       if (req.method === 'OPTIONS') {
         res.writeHead(origin && isTrustedOrigin(origin) ? 204 : 403);
         res.end();
+        return;
+      }
+    }
+
+    // 改动型管理端点: 同源校验 + 必须带自定义头 (HTML 表单无法设置 -> 跨站 CSRF 失效)
+    if (req.method !== 'GET' && MUTATING_GW_PATHS.has(url.pathname)) {
+      if (!originAllowed(req)) {
+        appendAccessLog({ ip: clientIp, method: req.method, path: url.pathname, status: 'CSRF_REJECTED', ua, note: 'origin mismatch' });
+        sendJson(res, 403, { ok: false, error: 'cross-origin request rejected' });
+        return;
+      }
+      if (!csrfHeaderOk(req)) {
+        appendAccessLog({ ip: clientIp, method: req.method, path: url.pathname, status: 'CSRF_REJECTED', ua, note: `missing ${CSRF_HEADER}` });
+        sendJson(res, 403, { ok: false, error: `missing ${CSRF_HEADER}: 1 header` });
         return;
       }
     }
@@ -1465,8 +1599,8 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 405, { ok: false, error: 'POST only' });
         return;
       }
-      if (!authed) {
-        sendJson(res, 403, { ok: false, error: 'unauthorized', login: '/__gw/login' });
+      if (!canManage) {
+        sendJson(res, 403, { ok: false, error: 'password required', need: 'session', login: '/__gw/login' });
         return;
       }
       const pairRec = createPairingToken();
@@ -1484,8 +1618,8 @@ const server = http.createServer(async (req, res) => {
     // 设备管理 (查询 / 撤销单台 / 撤销全部)
     // ==========================================
     if (url.pathname === '/__gw/devices') {
-      if (!authed) {
-        sendJson(res, 403, { ok: false, error: 'unauthorized' });
+      if (!canManage) {
+        sendJson(res, 403, { ok: false, error: 'password required', need: 'session', login: '/__gw/login' });
         return;
       }
       // 脱敏输出，不泄露 tokenHash
@@ -1499,8 +1633,8 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 405, { ok: false, error: 'POST only' });
         return;
       }
-      if (!authed) {
-        sendJson(res, 403, { ok: false, error: 'unauthorized' });
+      if (!canManage) {
+        sendJson(res, 403, { ok: false, error: 'password required', need: 'session', login: '/__gw/login' });
         return;
       }
       let body = {};
@@ -1540,9 +1674,9 @@ const server = http.createServer(async (req, res) => {
     // ==========================================
     if (url.pathname === '/__gw/login') {
       if (req.method === 'POST') {
-        const limit = checkRateLimit(clientIp);
+        const limit = checkLoginAllowed({ clientIp, peerIp: peer });
         if (!limit.allowed) {
-          appendAccessLog({ ip: clientIp, method: 'POST', path: '/__gw/login', status: 'RATE_LIMIT', ua, note: `locked remain ${limit.remainSec}s` });
+          appendAccessLog({ ip: clientIp, method: 'POST', path: '/__gw/login', status: 'RATE_LIMIT', ua, note: `locked remain ${limit.remainSec}s (scope=${limit.scope})` });
           sendHtml(res, 429, loginPage(`尝试失败次数过多，已被临时锁定，请等待 ${limit.remainSec} 秒后再试`, limit.remainSec));
           return;
         }
@@ -1553,7 +1687,7 @@ const server = http.createServer(async (req, res) => {
         const ok = verifyPassword(pw, passwordHash);
 
         if (ok) {
-          resetLoginFailure(clientIp);
+          resetLoginFailure({ clientIp, peerIp: peer });
           if (!refreshDshSecret()) {
             appendAccessLog({ ip: clientIp, method: 'POST', path: '/__gw/login', status: 'LOGIN_NO_COSIGN', ua });
             sendHtml(res, 503, loginPage('网关暂时无法完成 DSH 代签（找不到 DSH 浏览器会话密钥）。请确认 DSH 已启动后重试。', 0));
@@ -1563,8 +1697,8 @@ const server = http.createServer(async (req, res) => {
           appendAccessLog({ ip: clientIp, method: 'POST', path: '/__gw/login', status: 'LOGIN_OK', ua });
           homeRedirect(req, res);
         } else {
-          recordLoginFailure(clientIp);
-          const afterLimit = checkRateLimit(clientIp);
+          recordLoginFailure({ clientIp, peerIp: peer });
+          const afterLimit = checkLoginAllowed({ clientIp, peerIp: peer });
           const lockedSec = !afterLimit.allowed ? afterLimit.remainSec : 0;
           const errText = lockedSec > 0
             ? `连续失败次数过多，已被临时锁定，请等待 ${lockedSec} 秒后再试`
@@ -1580,7 +1714,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const limit = checkRateLimit(clientIp);
+      const limit = checkLoginAllowed({ clientIp, peerIp: peer });
       sendHtml(res, 200, loginPage(limit.allowed ? '' : `尝试失败次数过多，已被临时锁定，请等待 ${limit.remainSec} 秒后再试`, limit.allowed ? 0 : limit.remainSec));
       return;
     }
@@ -1600,8 +1734,8 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 405, { ok: false, error: 'POST only' });
         return;
       }
-      if (!authed) {
-        sendJson(res, 403, { ok: false, error: 'unauthorized', login: '/__gw/login' });
+      if (!canManage) {
+        sendJson(res, 403, { ok: false, error: 'password required', need: 'session', login: '/__gw/login' });
         return;
       }
       let body = '';
@@ -1642,8 +1776,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/__gw/config') {
-      if (!authed) {
-        sendJson(res, 403, { ok: false, error: 'unauthorized' });
+      if (!canManage) {
+        sendJson(res, 403, { ok: false, error: 'password required', need: 'session', login: '/__gw/login' });
         return;
       }
       if (req.method === 'POST') {
@@ -1691,8 +1825,8 @@ const server = http.createServer(async (req, res) => {
     // 管理端点 3: 密钥/凭证总览与轮换
     // ==========================================
     if (url.pathname === '/__gw/admin/keys') {
-      if (!authed) {
-        sendJson(res, 403, { ok: false, error: 'unauthorized' });
+      if (!canManage) {
+        sendJson(res, 403, { ok: false, error: 'password required', need: 'session', login: '/__gw/login' });
         return;
       }
       sendJson(res, 200, { ok: true, ...secretSummary() });
@@ -1704,8 +1838,8 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 405, { ok: false, error: 'POST only' });
         return;
       }
-      if (!authed) {
-        sendJson(res, 403, { ok: false, error: 'unauthorized' });
+      if (!canManage) {
+        sendJson(res, 403, { ok: false, error: 'password required', need: 'session', login: '/__gw/login' });
         return;
       }
       rotateAdminKey();
@@ -1719,8 +1853,8 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 405, { ok: false, error: 'POST only' });
         return;
       }
-      if (!authed) {
-        sendJson(res, 403, { ok: false, error: 'unauthorized' });
+      if (!canManage) {
+        sendJson(res, 403, { ok: false, error: 'password required', need: 'session', login: '/__gw/login' });
         return;
       }
       const reloaded = [];
@@ -1744,8 +1878,8 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 405, { ok: false, error: 'POST only' });
         return;
       }
-      if (!authed) {
-        sendJson(res, 403, { ok: false, error: 'unauthorized' });
+      if (!canManage) {
+        sendJson(res, 403, { ok: false, error: 'password required', need: 'session', login: '/__gw/login' });
         return;
       }
       const revoked = revokeAllSessions();
@@ -1758,8 +1892,8 @@ const server = http.createServer(async (req, res) => {
     // 管理端点 4: 审计日志 (最近 50 条)
     // ==========================================
     if (url.pathname === '/__gw/logs') {
-      if (!authed) {
-        sendJson(res, 403, { ok: false, error: 'unauthorized' });
+      if (!canManage) {
+        sendJson(res, 403, { ok: false, error: 'password required', need: 'session', login: '/__gw/login' });
         return;
       }
       let logs = [];
@@ -1781,8 +1915,8 @@ const server = http.createServer(async (req, res) => {
     // 公开端点 3: 状态 (最小字段; 携带凭证时返回全量)
     // ==========================================
     if (url.pathname === '/__gw/status') {
-      const base = { ok: true, listen: PORT, authed, time: new Date().toISOString() };
-      if (!authed) {
+      const base = { ok: true, listen: PORT, authed, authType, canManage, buildId: BUILD_ID, time: new Date().toISOString() };
+      if (!canManage) {
         sendJson(res, 200, base);
         return;
       }
@@ -1792,10 +1926,11 @@ const server = http.createServer(async (req, res) => {
         upstream: `${UP_HOST}:${UP_PORT}`,
         bind: BIND_HOST,
         clientIp,
-        peerIp: peerIp(req),
+        peer: peer,
         isPrivateLan: isPrivateLanIp(clientIp),
         config: configPayload(),
         overlayCidrs: overlayCidrs(),
+        requireHttps: REQUIRE_HTTPS,
         port3080Exposed: exposure.exposed,
         port3080CheckedIp: exposure.checkedIp,
         dshCosign: Boolean(refreshDshSecret()),
@@ -1827,6 +1962,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // 管理面与浏览面分离: 插件控制面 (/api/gw/*) 只允许管理员级凭证
+    if (url.pathname.startsWith('/api/gw/') && !canManage) {
+      appendAccessLog({ ip: clientIp, method: req.method, path: url.pathname, status: 'DENIED', ua, note: 'device credential on plugin control plane' });
+      sendJson(res, 403, { ok: false, error: 'password required', need: 'session', login: '/__gw/login' });
+      return;
+    }
+
     // 统一门禁: 其余一切 (含 DSH 页面、静态资源、API、WebSocket) 都必须持有有效凭证
     if (!authed) {
       if (url.pathname === '/' || url.pathname === '/index.html') {
@@ -1848,17 +1990,32 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.on('upgrade', (req, socket, head) => {
-  if (!authenticated(req)) {
-    socket.write('HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n');
-    socket.destroy();
-    return;
+  try {
+    socket.on('error', () => {});
+    if (!authenticated(req)) {
+      try { socket.write('HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n'); } catch {}
+      socket.destroy();
+      return;
+    }
+    proxyUpgrade(req, socket, head);
+  } catch (e) {
+    console.error('[gw-security] upgrade failed:', (e && e.message) || e);
+    try { socket.destroy(); } catch {}
   }
-  proxyUpgrade(req, socket, head);
 });
 
 server.on('clientError', (_err, socket) => socket.destroy());
 server.listen(PORT, BIND_HOST, () => {
   console.log(`[gw] listen ${BIND_HOST}:${PORT} -> ${UP_HOST}:${UP_PORT} (uniform gate: login / pairing token / device credential)`);
   console.log(`[gw-security] ✓ 所有来源(含本机回环)都必须通过口令或配对令牌校验; 内部管理密钥: ${ADMIN_FILE}`);
+});
+// 网关没有守护进程: 任何漏网异常都只记录不退出, 避免一次坏请求变成停机
+process.on('uncaughtException', (err) => {
+  console.error('[gw-security] uncaughtException (kept alive):', (err && err.stack) || err);
+  appendAccessLog({ ip: 'internal', method: '-', path: '-', status: 'UNCAUGHT', ua: '', note: String((err && err.message) || err).slice(0, 200) });
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[gw-security] unhandledRejection (kept alive):', reason);
+  appendAccessLog({ ip: 'internal', method: '-', path: '-', status: 'UNHANDLED_REJECTION', ua: '', note: String((reason && reason.message) || reason).slice(0, 200) });
 });
 process.on('SIGTERM', () => server.close(() => process.exit(0)));

@@ -6,6 +6,8 @@
 #       gw.sh keys                   查看密钥/凭证总览 (不含任何密钥值)
 #       gw.sh sessions revoke        强制所有浏览器会话重新登录
 set -e
+# 日志里有来源 IP 与首次口令, 新建文件一律 0600
+umask 077
 DIR="$(cd "$(dirname "$0")" && pwd)"
 GW_LOG="$DIR/gateway.log"
 TN_LOG="$DIR/tunnel.log"
@@ -14,6 +16,11 @@ TN_PID="$DIR/tunnel.pid"
 ADMIN_FILE="$DIR/.gw_admin"
 
 gw_port() { echo "${GW_PORT:-3081}"; }
+
+# 网关构建号 = gateway.mjs 的 sha256 前 12 位, 供插件检测"磁盘已更新但进程仍是旧版"
+build_id() {
+  node -e "const c=require('crypto'),f=require('fs');try{process.stdout.write(c.createHash('sha256').update(f.readFileSync(process.argv[1])).digest('hex').slice(0,12))}catch{process.stdout.write('dev')}" "$DIR/gateway.mjs" 2>/dev/null || echo dev
+}
 
 # 内部管理密钥: 网关/插件共用, 0600 持久化; 这里只在缺失时创建
 ensure_admin_token() {
@@ -25,7 +32,7 @@ ensure_admin_token() {
 # 带内部密钥调用网关 (缺失密钥时退化为匿名调用)
 gw_curl() {
   local method="$1" path="$2" body="${3:-}"
-  local -a args=(-s -X "$method")
+  local -a args=(-s -X "$method" -H "x-gw-request: 1")
   if [ -s "$ADMIN_FILE" ]; then args+=(-H "x-gw-admin: $(cat "$ADMIN_FILE")"); fi
   if [ -n "$body" ]; then args+=(-H "content-type: application/json" -d "$body"); fi
   curl "${args[@]}" "http://127.0.0.1:$(gw_port)$path"
@@ -70,7 +77,8 @@ do_start() {
     echo "gateway already running (pid $(cat "$GW_PID"))"
   else
     [ -z "${GW_PASSWORD:-}" ] && [ ! -f "$DIR/.gw_password" ] && echo "提示: 首次启动将自动生成随机口令, 见 gateway.log 的 FIRST_START_PASSWORD"
-    GW_PORT="$(gw_port)" nohup node "$DIR/gateway.mjs" >> "$GW_LOG" 2>&1 &
+    chmod 600 "$GW_LOG" "$TN_LOG" "$DIR/access.log" 2>/dev/null || true
+    GW_BUILD_ID="$(build_id)" GW_PORT="$(gw_port)" nohup node "$DIR/gateway.mjs" >> "$GW_LOG" 2>&1 &
     echo $! > "$GW_PID"
     echo "gateway started on :$(gw_port) (pid $!)"
     sleep 1
@@ -148,6 +156,16 @@ do_password() {
     fs.writeFileSync(file, `scrypt$16384$8$1$${salt}$${d}\n`, { mode: 0o600 });
   ' "$DIR/.gw_password"
   echo "口令哈希已更新 (scrypt 加盐)"
+  # 首次启动的明文口令曾写进 gateway.log, 改完口令后把该行脱敏
+  node -e '
+    const fs = require("fs");
+    const file = process.argv[1];
+    try {
+      const text = fs.readFileSync(file, "utf8");
+      const next = text.replace(/FIRST_START_PASSWORD=[A-Za-z0-9]+/g, "FIRST_START_PASSWORD=<redacted>");
+      if (next !== text) fs.writeFileSync(file, next, { mode: 0o600 });
+    } catch {}
+  ' "$GW_LOG"
   if pid_running "$GW_PID" "gateway.mjs"; then
     local out
     out="$(gw_curl POST /__gw/admin/reload)"

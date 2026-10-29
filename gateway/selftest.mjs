@@ -43,7 +43,7 @@ function startUpstream() {
 
 function startGateway(dir, port, upstreamPort) {
   const child = spawn(process.execPath, [GATEWAY], {
-    env: { ...process.env, GW_DIR: dir, GW_PORT: String(port), GW_UPSTREAM_PORT: String(upstreamPort) },
+    env: { ...process.env, GW_DIR: dir, GW_PORT: String(port), GW_UPSTREAM_PORT: String(upstreamPort), GW_BUILD_ID: 'selftest-build' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const state = { child, out: '' };
@@ -84,6 +84,7 @@ function stopGateway(state) {
 async function call(port, method, pathname, options = {}) {
   const headers = { ...(options.headers || {}) };
   if (options.cookie) headers.cookie = options.cookie;
+  if (method !== 'GET' && !options.noCsrf && !headers['x-gw-request']) headers['x-gw-request'] = '1';
   if (options.body !== undefined && !headers['content-type']) headers['content-type'] = 'application/json';
   const res = await fetch(`http://127.0.0.1:${port}${pathname}`, {
     method,
@@ -177,6 +178,10 @@ try {
   const cfgAdminBody = JSON.parse(cfgAdmin.text);
   check('内部密钥 /__gw/config → 200', cfgAdmin.status === 200 && cfgAdminBody.config.deviceTtlDays === 365, cfgAdmin.text);
 
+  const statusAdmin = await call(port, 'GET', '/__gw/status', { headers: admin });
+  const statusAdminBody = JSON.parse(statusAdmin.text);
+  check('全量状态带 buildId / canManage', statusAdminBody.buildId === 'selftest-build' && statusAdminBody.canManage === true, statusAdmin.text);
+
   // 4) 设备列表: 无凭证 403, 有凭证且无 tokenHash
   const devNoAuth = await call(port, 'GET', '/__gw/devices');
   const devAdmin = await call(port, 'GET', '/__gw/devices', { headers: admin });
@@ -237,6 +242,19 @@ try {
   const deviceRoot = await call(port, 'GET', '/', { cookie: deviceCookie });
   check('设备凭证放行页面', deviceRoot.status === 200, String(deviceRoot.status));
 
+  // 最小权限: 扫码设备只能浏览, 管理面必须口令会话
+  const devListAsDevice = await call(port, 'GET', '/__gw/devices', { cookie: deviceCookie });
+  check('设备凭证访问设备管理 → 403 need session', devListAsDevice.status === 403 && devListAsDevice.text.includes('password required'), `${devListAsDevice.status} ${devListAsDevice.text}`);
+  const devPwAsDevice = await call(port, 'POST', '/__gw/password', { cookie: deviceCookie, body: JSON.stringify({ password: 'device-cannot-change' }) });
+  check('设备凭证改口令 → 403', devPwAsDevice.status === 403, String(devPwAsDevice.status));
+  const devStatus = await call(port, 'GET', '/__gw/status', { cookie: deviceCookie });
+  const devStatusBody = JSON.parse(devStatus.text);
+  check('设备凭证只拿到最小状态且 canManage=false', devStatusBody.canManage === false && devStatusBody.authType === 'device' && !('upstream' in devStatusBody), devStatus.text);
+  const sessList = await call(port, 'GET', '/__gw/devices', { cookie: sessionCookie });
+  check('口令会话访问设备管理 → 200', sessList.status === 200, String(sessList.status));
+  const proxiedAsDevice = await call(port, 'GET', '/api/gw/status', { cookie: deviceCookie });
+  check('设备凭证访问 /api/gw/* → 403', proxiedAsDevice.status === 403, String(proxiedAsDevice.status));
+
   // 12) 设备凭证到期 (服务端校验)
   const devicesFile = path.join(dir, 'devices.json');
   const deviceList = readJson(devicesFile, []);
@@ -264,6 +282,14 @@ try {
   const newKey = fs.readFileSync(adminKeyPath, 'utf8').trim();
   const cfgNewKey = await call(port, 'GET', '/__gw/config', { headers: { 'x-gw-admin': newKey } });
   check('轮换内部密钥 → 200', rotate.status === 200 && newKey !== adminKey, rotate.text);
+
+  // CSRF: 跨站 Origin / 缺自定义头都必须被拒
+  const csrfMissing = await call(port, 'POST', '/__gw/config', { headers: { 'x-gw-admin': newKey }, body: JSON.stringify({ deviceTtlDays: 365 }), noCsrf: true });
+  check('缺 x-gw-request → 403', csrfMissing.status === 403, `${csrfMissing.status} ${csrfMissing.text}`);
+  const csrfCross = await call(port, 'POST', '/__gw/config', { headers: { 'x-gw-admin': newKey, origin: 'https://evil.example' }, body: JSON.stringify({ deviceTtlDays: 365 }) });
+  check('跨站 Origin → 403', csrfCross.status === 403, `${csrfCross.status} ${csrfCross.text}`);
+  const csrfSame = await call(port, 'POST', '/__gw/config', { headers: { 'x-gw-admin': newKey, origin: `http://127.0.0.1:${port}` }, body: JSON.stringify({ deviceTtlDays: 365 }) });
+  check('同源 Origin + 自定义头 → 200', csrfSame.status === 200, `${csrfSame.status} ${csrfSame.text}`);
   check('旧密钥立即失效 (403)', cfgOldKey.status === 403, String(cfgOldKey.status));
   check('新密钥立即生效 (200)', cfgNewKey.status === 200, String(cfgNewKey.status));
 
@@ -288,6 +314,25 @@ try {
   const wsNoAuth = await upgradeAttempt(port, {});
   check('WebSocket 无凭证 → 401', wsNoAuth === 401, String(wsNoAuth));
 
+  // 18b) 畸形 Cookie 不允许打崩进程 (HTTP 与 WebSocket 两条路径)
+  const badCookie = await call(port, 'GET', '/', { headers: { cookie: 'gw_session=%E0%A4%A; gw_device=%ZZ' } });
+  const aliveAfterBadCookie = await call(port, 'GET', '/__gw/status');
+  check('畸形 Cookie 按未登录处理且进程存活', badCookie.status === 303 && aliveAfterBadCookie.status === 200, `${badCookie.status}/${aliveAfterBadCookie.status}`);
+  const wsBadCookie = await upgradeAttempt(port, { cookie: 'gw_session=%E0%A4%A' });
+  const aliveAfterWs = await call(port, 'GET', '/__gw/status');
+  check('WS + 畸形 Cookie → 401 且进程存活', wsBadCookie === 401 && aliveAfterWs.status === 200, `${wsBadCookie}/${aliveAfterWs.status}`);
+
+  // 18c) 登出同时清掉 DSH 代签 Cookie
+  const relogin = await call(port, 'POST', '/__gw/login', { body: `password=${encodeURIComponent(password)}`, headers: { 'content-type': 'application/x-www-form-urlencoded' } });
+  const reloginCookie = pickCookie(relogin.setCookies, 'gw_session');
+  const logout = await call(port, 'GET', '/__gw/logout', { cookie: reloginCookie });
+  const clearedDsh = logout.setCookies.some((c) => c.startsWith('dsh-auth-') && /Max-Age=0/i.test(c));
+  check('登出清理 DSH 代签 Cookie', logout.status === 200 && clearedDsh, logout.setCookies.map((c) => c.split(';')[0]).join(' | '));
+
+  // 18d) 审计日志权限
+  const accessLogPath = path.join(dir, 'access.log');
+  check('access.log 为 0600', (fs.statSync(accessLogPath).mode & 0o777) === 0o600, String(fs.statSync(accessLogPath).mode & 0o777));
+
   // 19) 口令登录限流 (放最后, 会把 127.0.0.1 锁住)
   let lastStatus = 200;
   for (let i = 0; i < 6; i += 1) {
@@ -295,6 +340,17 @@ try {
     lastStatus = r.status;
   }
   check('连续失败后返回 429 锁定', lastStatus === 429, String(lastStatus));
+
+  // 19b) 换着 X-Forwarded-For 也不能绕过: peer 桶兜底
+  let rotateLast = 200;
+  for (let i = 0; i < 16; i += 1) {
+    const r = await call(port, 'POST', '/__gw/login', {
+      body: 'password=still-wrong',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-forwarded-for': `203.0.113.${i + 1}` },
+    });
+    rotateLast = r.status;
+  }
+  check('轮换 XFF 仍被 peer 桶锁定 (429)', rotateLast === 429, String(rotateLast));
 } catch (error) {
   check('自检未抛异常', false, String((error && error.stack) || error));
 } finally {

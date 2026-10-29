@@ -97,7 +97,7 @@ const ctx = {
   },
 };
 
-function callRoute(pathname, { method = 'GET', body, headers = {} } = {}) {
+function callRoute(pathname, { method = 'GET', body, headers = {}, noCsrf = false } = {}) {
   return new Promise((resolve, reject) => {
     const handler = routes.get(pathname);
     if (!handler) {
@@ -105,10 +105,12 @@ function callRoute(pathname, { method = 'GET', body, headers = {} } = {}) {
       return;
     }
     const payload = body === undefined ? '' : JSON.stringify(body);
+    const baseHeaders = { host: '127.0.0.1:3080', ...headers };
+    if (method !== 'GET' && !noCsrf && !baseHeaders['x-gw-request']) baseHeaders['x-gw-request'] = '1';
     const req = {
       method,
       url: pathname,
-      headers: { host: `127.0.0.1:3080`, ...headers },
+      headers: baseHeaders,
       on(event, cb) {
         if (event === 'data' && payload) cb(Buffer.from(payload));
         if (event === 'end') cb();
@@ -171,6 +173,21 @@ try {
 
   const revokeCross = await callRoute('/api/gw/devices/revoke', { method: 'POST', body: { all: true }, headers: { referer: 'https://evil.example/x' } });
   check('跨站 POST /api/gw/devices/revoke 被拦下', revokeCross.status === 403, revokeCross.raw);
+
+  const controlCross = await callRoute('/api/gw/control', { method: 'POST', body: { action: 'restart' }, headers: { origin: 'https://evil.example' } });
+  check('跨站 POST /api/gw/control 被拦下', controlCross.status === 403, controlCross.raw);
+
+  const remotesCross = await callRoute('/api/gw/remotes', { method: 'POST', body: { op: 'activate', id: null }, headers: { origin: 'https://evil.example' } });
+  check('跨站 POST /api/gw/remotes 被拦下', remotesCross.status === 403, remotesCross.raw);
+
+  const noCsrf = await callRoute('/api/gw/remotes', { method: 'POST', body: { op: 'activate', id: null }, noCsrf: true });
+  check('缺 x-gw-request 的改动请求被拦下', noCsrf.status === 403 && /x-gw-request/.test(noCsrf.raw), noCsrf.raw);
+
+  const statusDevice = await callRoute('/api/gw/status', { headers: { 'x-gw-auth': 'device' } });
+  check('x-gw-auth=device → canManage=false', statusDevice.status === 200 && statusDevice.body.canManage === false, String(statusDevice.body && statusDevice.body.canManage));
+
+  const statusLocal = await callRoute('/api/gw/status');
+  check('无 x-gw-auth（本机直连）→ canManage=true', statusLocal.status === 200 && statusLocal.body.canManage === true, String(statusLocal.body && statusLocal.body.canManage));
 
   check('所有网关调用都带了 x-gw-admin', seen.length > 0 && seen.every((entry) => entry.authed), JSON.stringify(seen.filter((e) => !e.authed)));
 } catch (error) {

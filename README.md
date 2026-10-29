@@ -75,7 +75,8 @@ DSH 启动完成（Web 服务就绪）后，插件探测 `127.0.0.1:3081`：
 
 - 内部管理密钥**只认回环 peer**：即使密钥泄露也无法从公网/局域网使用。
 - 设备凭证由服务端强制校验 `expiresAt`（`deviceTtlDays`，默认 365 天），过期自动标记 `expired`。
-- 改口令默认同时失效全部会话，可选同时撤销全部设备。
+- 改口令会立即失效全部会话；「同时撤销全部设备」是可选项（默认不勾选）。
+- `gateway.log` / `tunnel.log` / `access.log` 一律 `0600`；首次启动的明文口令在改口令后自动脱敏成 `<redacted>`。
 - `devices.json` / `sessions.json` 损坏时会被改名成 `.corrupt-<时间戳>`，服务以空集启动（失败关闭），绝不覆盖原文件。
 
 ## 环境变量
@@ -91,6 +92,9 @@ DSH 启动完成（Web 服务就绪）后，插件探测 `127.0.0.1:3081`：
 | `GW_DEVICE_TTL_D` | 设备凭证有效期天数（默认 365，等价于 `config.json.deviceTtlDays`） |
 | `GW_SESSION_TTL_H` | 网页会话有效期小时（默认 24） |
 | `GW_UPSTREAM_HOST` / `GW_UPSTREAM_PORT` | 上游 DSH 地址（默认 `127.0.0.1:3080`） |
+| `GW_REQUIRE_HTTPS=1` | 拒绝非回环的明文 HTTP 请求（426 页面），用于 FRP/裸端口场景防窃听 |
+| `DSH_GW_NO_AUTO_RESTART=1` | 关闭「检测到进程版本落后时自动 `gw.sh restart`」 |
+| `GW_BUILD_ID` | 网关构建号（`gw.sh` 自动注入 sha256 前 12 位，供插件比对） |
 
 `config.json`（可用面板「访问策略」修改部分字段）：
 
@@ -137,19 +141,31 @@ DSH 启动完成（Web 服务就绪）后，插件探测 `127.0.0.1:3081`：
 
 ## 安全模型
 
+**三种凭证，权限不同**
+
+| 凭证 | 怎么来 | 能做什么 |
+|---|---|---|
+| `gw_session` | `/__gw/login` 输入网关口令（默认 24h，落盘持久化） | 浏览 + **全部管理操作** |
+| `gw_device` | 扫码消费一次性配对令牌（默认 365 天，可撤销） | **只读**：浏览 DSH、可登出；管理接口一律 403 `need: session` |
+| `x-gw-admin` | `~/.dsh/gateway/.gw_admin`（插件 / `gw.sh` / `gw_gateway` 工具） | 管理，但**只有回环 peer** 能用 |
+
 | 请求 | 条件 | 结果 |
 |---|---|---|
-| `/__gw/login` | — | 公开：登录页 / 提交口令（失败 5 次后指数退避锁定） |
+| `/__gw/login` | — | 公开：登录页 / 提交口令（三层限流：5 次/客户端、15 次/socket 对端、60 次/10 分钟全局） |
 | `/__gw/pair?t=` | 有效的一次性令牌 | 公开消费 → 种设备凭证 → 303 `/` |
 | `/__gw/qr` | — | 公开：渲染指定 URL 的二维码 |
-| `/__gw/status` | — | 公开：只返回 `{ok, listen, authed}`；带凭证时返回全量 |
+| `/__gw/status` | — | 公开只给最小字段（含 `authType` / `canManage` / `buildId`）；会话或内部密钥才给全量 |
 | 其它 `/__gw/*`、`/api/*`、页面、WebSocket | 无有效凭证 | 303 → 登录页 / API 401 |
-| 上述任意路径 | `gw_session` / `gw_device` | 放行（管理接口同样只要求这层凭证） |
-| 管理接口 | `x-gw-admin` **且 peer 必须是回环** | 放行（插件 / 脚本专用） |
+| 任意路径 | `gw_session` 或 `gw_device` | 可浏览（WebSocket 同样校验） |
+| 管理接口与 `/api/gw/*` | `gw_session` 或 `x-gw-admin` | 放行；`gw_device` → 403 |
+| 改动型管理接口 | **额外要求** `Origin`/`Referer` 与本次请求同源，且带 `x-gw-request: 1` | 否则 403（HTML 表单无法设置自定义头 → 跨站 CSRF 失效） |
 
 - 客户端 IP 只用于展示与审计，**不参与鉴权**；只有 `GW_TRUSTED_PROXIES` 里的 peer 的
   `cf-connecting-ip` / `x-forwarded-for` / `x-real-ip` 会被采信，其余一律忽略。
+- 登录限流不只看可伪造的客户端 IP：socket 对端桶与全局限流窗口兜住「每次换 XFF」的尝试。
 - 登录/配对成功后跳转 `303 /`，URL 里不会出现任何 token；DSH 访问靠代签 Cookie 完成。
+- 登出会同时清掉 `gw_session`、`gw_device` 与 DSH 代签的 `dsh-auth-*`，不留 30 天旁路凭证。
+- 畸形 Cookie（非法百分号编码）按未登录处理，不会让网关进程退出；HTTP 与 WebSocket 两条路径都有保护。
 - 网关自产页面带 CSP / nosniff / referrer-policy / frame-options；CORS 只反射回环与 `remotes.json` 里的精确 origin。
 
 ### 隧道注意事项
@@ -166,8 +182,13 @@ DSH 启动完成（Web 服务就绪）后，插件探测 `127.0.0.1:3081`：
 cd ~/.dsh/gateway && node gateway/selftest.mjs   # 或在仓库里 npm test
 ```
 
-自检会在临时目录 + 随机端口 + 假 upstream 上验证 36 条断言：门禁、伪造转发头、口令限流、
-配对令牌消费与重放、设备到期与撤销、会话落盘与跨重启、密钥轮换、WebSocket 门禁等。
+`npm test` 跑三套零依赖自检：
+
+| 套件 | 断言数 | 覆盖 |
+|---|---|---|
+| `gateway/selftest.mjs` | 50 | 统一门禁、伪造转发头、三层限流、配对令牌重放、设备到期/撤销、会话落盘与跨重启、密钥轮换、设备只读、CSRF 头与同源、畸形 Cookie 不崩、登出清 DSH Cookie、日志 0600、WebSocket 门禁 |
+| `test/plugin-selftest.mjs` | 17 | 插件每个 `/api/gw/*` 都带内部密钥、同源 + 自定义头校验、`canManage` 判定 |
+| `test/client-render.mjs` | 5 | 三个 Tab 与「扫码设备只读」横幅能正常渲染 |
 
 线上快速验收：
 
@@ -179,9 +200,17 @@ curl -si https://<你的域名>/__gw/config        # 403
 curl -s  https://<你的域名>/__gw/status        # 只有 {ok,listen,authed}
 curl -si https://<你的域名>/                   # 303 -> /__gw/login
 
-# 内部管理密钥仍可管理
+# 内部管理密钥仍可管理（只读接口不需要 x-gw-request）
 curl -s -H "x-gw-admin: $(cat ~/.dsh/gateway/.gw_admin)" \
      http://127.0.0.1:3081/__gw/admin/keys
+
+# 改动型接口必须带自定义头 + 同源，否则 403
+curl -s -X POST -H "x-gw-admin: $(cat ~/.dsh/gateway/.gw_admin)" \
+     -H 'x-gw-request: 1' -H 'content-type: application/json' \
+     -d '{"deviceTtlDays":365}' http://127.0.0.1:3081/__gw/config
+
+# 设备凭证只读：用扫码得到的 gw_device 访问管理接口应 403
+curl -si -H "Cookie: gw_device=<扫码设备 token>" http://127.0.0.1:3081/__gw/devices
 ```
 
 ## 目录结构
@@ -193,10 +222,13 @@ dsh-gateway-ctl/
 ├── lib/
 │   ├── index.js        # Host: gw_gateway 工具 + /api/gw/* 路由 + 内部密钥 + 启动自启 + 部署
 │   └── client.js       # Client: 侧栏入口 + 扫码/地址/设置三 Tab（设备指纹分组、密钥卡片）
-└── gateway/
-    ├── gateway.mjs     # 独立网关: 统一门禁 + 持久化凭证 + 设备到期 + DSH 代签 + 登录页
-    ├── gw.sh           # 启停 / 口令 / 密钥轮换 / 会话撤销
-    └── selftest.mjs    # 零依赖自检 (36 条断言)
+├── gateway/
+│   ├── gateway.mjs     # 独立网关: 统一门禁 + 持久化凭证 + 设备到期 + 三层限流 + CSRF + DSH 代签
+│   ├── gw.sh           # 启停 / 口令(热加载+日志脱敏) / 密钥轮换 / 会话撤销 / build id
+│   └── selftest.mjs    # 零依赖自检 (50 条断言)
+└── test/
+    ├── plugin-selftest.mjs  # 插件 Host 路由自检 (内部密钥 + 同源 + canManage)
+    └── client-render.mjs    # 面板三 Tab + 只读态渲染自检
 ```
 
 运行期目录 `~/.dsh/gateway/` 里由插件维护：`gateway.mjs` / `gw.sh`（自动部署）、`config.json`、
@@ -211,3 +243,6 @@ dsh-gateway-ctl/
   LaunchAgent（`dsh web` + `gw.sh start`）或用固定域名 + Cloudflare Tunnel 常驻服务
 - 配对二维码本质上是 bearer 链接（一次性、90 秒），截获即用；长期建议再叠 Cloudflare Access
 - `GW_BIND=0.0.0.0` 时局域网可达 3081（需要口令）；纯隧道场景可设 `GW_BIND=127.0.0.1`
+- 网关自身不提供 TLS：FRP/NATFRP 直接暴露纯 HTTP 端口时，口令与会话 Cookie 会在公网明文传输；
+  请用 CF Tunnel / VPS 反代做 TLS 终止，或开启 `GW_REQUIRE_HTTPS=1` 让非回环明文请求直接 426 拒绝
+- 扫码设备是**只读**凭证：要在手机上管理网关，请用网关口令登录（`/__gw/login`），而不是扫码
